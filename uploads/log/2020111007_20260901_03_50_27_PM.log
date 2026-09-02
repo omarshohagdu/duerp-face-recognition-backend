@@ -1,0 +1,37 @@
+route: ext-api/wow-attendance/verify
+id: 2020111007
+started_at: 2026-09-01 15:50:27.766
+----
+Params:
+  query: {}
+  form: {"device_info":"{   \"os\": \"15\",   \"device\": \"V2246\",   \"latitude\": 23.7291368,   \"longitude\": 90.3984877,   \"app_version\": \"2.0.4\" }"}
+
+Steps:
+  [15:50:27.767] request received (client_ip=127.0.0.1)
+  [15:50:27.767] bearer token extracted from Authorization header
+  [15:50:27.767] token validation OK — LEGACY DU token, signature NOT verified (token user id=45320). This caller must migrate to this service's POST /login.
+  [15:50:27.767] parsing multipart body
+  [15:50:27.767] receiving live image 'WhatsApp Image 2026-07-09 at 12.54.26 PM.jpeg' -> 34577259-06a6-47c2-9185-0c8577341431_WhatsApp Image 2026-07-09 at 12.54.26 PM.jpeg
+  [15:50:27.768] live image saved (195676 bytes)
+  [15:50:27.768] File: /var/www/Rust/duerp/duerp-attendance/uploads/wow_attendance/live/34577259-06a6-47c2-9185-0c8577341431_WhatsApp Image 2026-07-09 at 12.54.26 PM.jpeg | url: /uploads/wow_attendance/live/34577259-06a6-47c2-9185-0c8577341431_WhatsApp%20Image%202026-07-09%20at%2012.54.26%20PM.jpeg
+  [15:50:27.768] multipart parsed
+  [15:50:27.768] calling AI platform /recognize
+  [15:50:28.294] stored live image: /var/www/Rust/duerp/duerp-attendance/uploads/wow_attendance/live/34577259-06a6-47c2-9185-0c8577341431_WhatsApp Image 2026-07-09 at 12.54.26 PM.jpeg
+  [15:50:28.294] AI recognize returned a response
+  [15:50:28.294] face recognized as identifier=2020111007
+  [15:50:28.322] DU getByEmployeeId: 2020111007 is an employee whose user_id=45320 — the token holder
+  [15:50:28.322] token holder owns recognized identifier=2020111007
+  [15:50:28.322] resolved id_type=Employee for id=2020111007
+  [15:50:28.322] matching recognized person_id=2020111007 against ictcell.wow_attendance_enrollments
+  [15:50:28.326] person_id=2020111007 matched an active enrollment
+  [15:50:28.326] checking location via ictcell.wow_attendance_location_verify (lat=23.7291368, long=90.3984877)
+  [15:50:28.392] location verified
+  [15:50:28.392] recording attendance via ictcell.wow_attendance_verify
+  [15:50:28.399] attendance recorded — returning 200
+
+Images:
+  /uploads/wow_attendance/live/34577259-06a6-47c2-9185-0c8577341431_WhatsApp%20Image%202026-07-09%20at%2012.54.26%20PM.jpeg
+
+Response (AI /recognize) 200: {"error":null,"id_type":"EMPLOYEE","identifier":"2020111007","name":"2020111007","recognized":true,"request_id":"2026-09-01_09-50-27.788975297Z","similarity":0.9320999065667368}
+
+Response (backend) 200: {"data":{"attendance_id":"eec6f3b5-d05b-45a0-83b0-5ce370ce56ff","confidence":1,"id":"2020111007","id_type":"Employee","matched_at":"2026-09-01T09:50:28.385763+00:00"},"location":{"body_code":"440000","building_id":1,"building_name":"ICT Cell - CARS","distance_m":0,"emp_id":"2020111007","emp_name":"MD. OMAR FARUK","radius_m":50},"matched":true,"message":"Attendance marked","success":true}

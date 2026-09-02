@@ -1,0 +1,31 @@
+route: ext-api/wow-attendance/verify
+id: 2020111007
+started_at: 2026-09-01 15:50:08.405
+----
+Params:
+  query: {}
+  form: {"device_info":"{   \"os\": \"15\",   \"device\": \"V2246\",   \"latitude\": 23.7291368,   \"longitude\": 90.3984877,   \"app_version\": \"2.0.4\" }"}
+
+Steps:
+  [15:50:08.405] request received (client_ip=127.0.0.1)
+  [15:50:08.405] bearer token extracted from Authorization header
+  [15:50:08.405] token validation OK — LEGACY DU token, signature NOT verified (token user id=4277). This caller must migrate to this service's POST /login.
+  [15:50:08.405] parsing multipart body
+  [15:50:08.405] receiving live image 'WhatsApp Image 2026-07-09 at 12.54.26 PM.jpeg' -> 526ad1fd-d2aa-4a4c-99a6-4b2af65a41d8_WhatsApp Image 2026-07-09 at 12.54.26 PM.jpeg
+  [15:50:08.406] live image saved (195676 bytes)
+  [15:50:08.406] File: /var/www/Rust/duerp/duerp-attendance/uploads/wow_attendance/live/526ad1fd-d2aa-4a4c-99a6-4b2af65a41d8_WhatsApp Image 2026-07-09 at 12.54.26 PM.jpeg | url: /uploads/wow_attendance/live/526ad1fd-d2aa-4a4c-99a6-4b2af65a41d8_WhatsApp%20Image%202026-07-09%20at%2012.54.26%20PM.jpeg
+  [15:50:08.406] multipart parsed
+  [15:50:08.406] calling AI platform /recognize
+  [15:50:08.941] stored live image: /var/www/Rust/duerp/duerp-attendance/uploads/wow_attendance/live/526ad1fd-d2aa-4a4c-99a6-4b2af65a41d8_WhatsApp Image 2026-07-09 at 12.54.26 PM.jpeg
+  [15:50:08.941] AI recognize returned a response
+  [15:50:08.941] face recognized as identifier=2020111007
+  [15:50:08.972] DU getByEmployeeId: 2020111007 is an employee, but its user_id=45320 is not the token holder (4277)
+  [15:50:08.972] Person identified but mismatch. face recognized as identifier=2020111007 but Logged in User id=4277
+  [15:50:08.976] token mismatch recorded (wow_attendance_token_mismatch_record)
+
+Images:
+  /uploads/wow_attendance/live/526ad1fd-d2aa-4a4c-99a6-4b2af65a41d8_WhatsApp%20Image%202026-07-09%20at%2012.54.26%20PM.jpeg
+
+Response (AI /recognize) 200: {"error":null,"id_type":"EMPLOYEE","identifier":"2020111007","name":"2020111007","recognized":true,"request_id":"2026-09-01_09-50-08.427145223Z","similarity":0.9320999065667368}
+
+Response (backend) 401: {"live_image":"/var/www/Rust/duerp/duerp-attendance/uploads/wow_attendance/live/526ad1fd-d2aa-4a4c-99a6-4b2af65a41d8_WhatsApp Image 2026-07-09 at 12.54.26 PM.jpeg","logged_in_user_id":4277,"matched":false,"message":"Person identified but mismatch. face recognized as identifier=2020111007 but Logged in User id=4277","recognized_identifier":"2020111007","success":false}

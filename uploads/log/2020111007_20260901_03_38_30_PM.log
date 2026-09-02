@@ -1,0 +1,28 @@
+route: ext-api/wow-attendance/enroll
+id: 2020111007
+started_at: 2026-09-01 15:38:30.536
+endpoint: POST /ext-api/wow-attendance/enroll
+----
+Params:
+  query: {}
+  form: {"id":"2020111007"}
+  form: {"device_info":"{   \"os\": \"15\",   \"device\": \"V2246\",   \"latitude\": 23.7291368,   \"longitude\": 90.3984877,   \"app_version\": \"2.0.4\" }"}
+
+Steps:
+  [15:38:30.536] request received (client_ip=127.0.0.1)
+  [15:38:30.536] bearer token extracted from Authorization header
+  [15:38:30.536] token validation OK — LEGACY DU token, signature NOT verified (token user id=4277). This caller must migrate to this service's POST /login.
+  [15:38:30.536] parsing multipart body
+  [15:38:30.536] receiving image 'WhatsApp Image 2026-07-09 at 12.54.26 PM.jpeg' (part_ct=image/jpeg) -> 7926d047-29c4-408a-b5d1-db17eba80d8d_WhatsApp Image 2026-07-09 at 12.54.26 PM.jpeg
+  [15:38:30.537] image saved (195676 bytes, detected=JPEG)
+  [15:38:30.537] File: /var/www/Rust/duerp/duerp-attendance/uploads/wow_attendance/enrolled/7926d047-29c4-408a-b5d1-db17eba80d8d_WhatsApp Image 2026-07-09 at 12.54.26 PM.jpeg | url: http://0.0.0.0:8083/uploads/wow_attendance/enrolled/7926d047-29c4-408a-b5d1-db17eba80d8d_WhatsApp%20Image%202026-07-09%20at%2012.54.26%20PM.jpeg
+  [15:38:30.537] multipart parsed — 1 image(s) saved
+  [15:38:30.537] resolved id=2020111007
+  [15:38:30.568] DU getByEmployeeId: 2020111007 is an employee, but its user_id=45320 is not the token holder (4277)
+  [15:38:30.568] Person mismatch. enroll id=2020111007 but Logged in User id=4277
+  [15:38:30.574] token mismatch recorded (wow_attendance_token_mismatch_record)
+
+Images:
+  http://0.0.0.0:8083/uploads/wow_attendance/enrolled/7926d047-29c4-408a-b5d1-db17eba80d8d_WhatsApp%20Image%202026-07-09%20at%2012.54.26%20PM.jpeg
+
+Response (backend) 401: {"enroll_id":"2020111007","logged_in_user_id":4277,"message":"Person mismatch. enroll id=2020111007 but Logged in User id=4277","success":false}

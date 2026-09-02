@@ -1,0 +1,36 @@
+route: ext-api/wow-attendance/enroll
+id: 2020111007
+started_at: 2026-09-01 15:49:51.844
+endpoint: POST /ext-api/wow-attendance/enroll
+----
+Params:
+  query: {}
+  form: {"id":"2020111007"}
+  form: {"device_info":"{   \"os\": \"15\",   \"device\": \"V2246\",   \"latitude\": 23.7291368,   \"longitude\": 90.3984877,   \"app_version\": \"2.0.4\" }"}
+
+Steps:
+  [15:49:51.844] request received (client_ip=127.0.0.1)
+  [15:49:51.844] bearer token extracted from Authorization header
+  [15:49:51.845] token validation OK — LEGACY DU token, signature NOT verified (token user id=45320). This caller must migrate to this service's POST /login.
+  [15:49:51.845] parsing multipart body
+  [15:49:51.845] receiving image 'WhatsApp Image 2026-07-09 at 12.54.26 PM.jpeg' (part_ct=image/jpeg) -> 58931280-c069-4a0a-ae67-de9c5f77b8b4_WhatsApp Image 2026-07-09 at 12.54.26 PM.jpeg
+  [15:49:51.845] image saved (195676 bytes, detected=JPEG)
+  [15:49:51.846] File: /var/www/Rust/duerp/duerp-attendance/uploads/wow_attendance/enrolled/58931280-c069-4a0a-ae67-de9c5f77b8b4_WhatsApp Image 2026-07-09 at 12.54.26 PM.jpeg | url: http://0.0.0.0:8083/uploads/wow_attendance/enrolled/58931280-c069-4a0a-ae67-de9c5f77b8b4_WhatsApp%20Image%202026-07-09%20at%2012.54.26%20PM.jpeg
+  [15:49:51.846] multipart parsed — 1 image(s) saved
+  [15:49:51.846] resolved id=2020111007
+  [15:49:51.888] DU getByEmployeeId: 2020111007 is an employee whose user_id=45320 — the token holder
+  [15:49:51.888] token holder owns enroll id=2020111007
+  [15:49:51.888] id_type resolved: Employee
+  [15:49:51.888] calling AI platform enroll (name='2020111007', images=1)
+  [15:49:55.295] AI enroll OK
+  [15:49:55.295] persisting enrollment via ictcell.wow_attendance_enroll
+  [15:49:55.303] stored 1 enrolled image(s): /var/www/Rust/duerp/duerp-attendance/uploads/wow_attendance/enrolled/58931280-c069-4a0a-ae67-de9c5f77b8b4_WhatsApp Image 2026-07-09 at 12.54.26 PM.jpeg
+  [15:49:55.303] DB enroll OK
+  [15:49:55.303] enrollment complete — returning 200
+
+Images:
+  http://0.0.0.0:8083/uploads/wow_attendance/enrolled/58931280-c069-4a0a-ae67-de9c5f77b8b4_WhatsApp%20Image%202026-07-09%20at%2012.54.26%20PM.jpeg
+
+Response (AI /enroll) 200: {"error":null,"request_id":"2026-09-01_09-49-54.412849387Z","success":true}
+
+Response (backend) 200: {"ai_enrolled":true,"data":{"enrolled_image_count":1,"enrollment_id":"f53c0045-f8b0-426e-9365-4ddcdf5e02d7","id":"2020111007","id_type":"Employee","is_reenrollment":true,"previous_enrollment_id":"0f5ad2c8-27ba-4d10-ab71-fb630a301ebe","version":9},"message":"Re-enrolled successfully","success":true}

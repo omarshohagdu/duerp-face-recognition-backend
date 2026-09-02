@@ -1,0 +1,27 @@
+route: ext-api/wow-attendance/verify
+id: unknown
+started_at: 2026-09-01 15:39:16.891
+----
+Params:
+  query: {}
+  form: {"device_info":"{   \"os\": \"15\",   \"device\": \"V2246\",   \"latitude\": 23.7291368,   \"longitude\": 90.3984877,   \"app_version\": \"2.0.4\" }"}
+
+Steps:
+  [15:39:16.891] request received (client_ip=127.0.0.1)
+  [15:39:16.891] bearer token extracted from Authorization header
+  [15:39:16.891] token validation OK — LEGACY DU token, signature NOT verified (token user id=4277). This caller must migrate to this service's POST /login.
+  [15:39:16.891] parsing multipart body
+  [15:39:16.892] receiving live image 'WhatsApp Image 2026-07-09 at 12.54.26 PM.jpeg' -> 584da533-41a4-4283-a406-2aa261f9e1b8_WhatsApp Image 2026-07-09 at 12.54.26 PM.jpeg
+  [15:39:16.892] live image saved (195676 bytes)
+  [15:39:16.892] File: /var/www/Rust/duerp/duerp-attendance/uploads/wow_attendance/live/584da533-41a4-4283-a406-2aa261f9e1b8_WhatsApp Image 2026-07-09 at 12.54.26 PM.jpeg | url: /uploads/wow_attendance/live/584da533-41a4-4283-a406-2aa261f9e1b8_WhatsApp%20Image%202026-07-09%20at%2012.54.26%20PM.jpeg
+  [15:39:16.892] multipart parsed
+  [15:39:16.893] calling AI platform /recognize
+  [15:39:18.544] stored live image: /var/www/Rust/duerp/duerp-attendance/uploads/wow_attendance/live/584da533-41a4-4283-a406-2aa261f9e1b8_WhatsApp Image 2026-07-09 at 12.54.26 PM.jpeg
+  [15:39:18.544] AI recognize: no match (Face not recognized)
+
+Images:
+  /uploads/wow_attendance/live/584da533-41a4-4283-a406-2aa261f9e1b8_WhatsApp%20Image%202026-07-09%20at%2012.54.26%20PM.jpeg
+
+Response (AI /recognize) 400: {"error":"Face not recognized","id_type":null,"identifier":null,"name":null,"recognized":false,"request_id":"2026-09-01_09-39-16.910807464Z","similarity":0.10460054874420166}
+
+Response (backend) 200: {"live_image":"/var/www/Rust/duerp/duerp-attendance/uploads/wow_attendance/live/584da533-41a4-4283-a406-2aa261f9e1b8_WhatsApp Image 2026-07-09 at 12.54.26 PM.jpeg","matched":false,"message":"No matching enrolled person found","reason":"Face not recognized","success":false}

@@ -1,0 +1,247 @@
+{
+  "info": {
+    "name": "WOW Attendance (ext-api)",
+    "description": "Face-based attendance endpoints. Every request requires the X-App-Id / X-App-Password headers (ExtAuthMiddleware), the caller IP must be allow-listed in ictcell.ext_api_allowed_ips for each endpoint, AND an `Authorization: Bearer <jwt>` header — the DU login access_token (from local.duwebadmin.com/api/login; its `sub` is the DU user id). On `enroll` the backend decodes that token WITHOUT verifying its signature (it is signed with DU's own secret) to read `sub`, then resolves id_type (Student/Employee) by calling the DU `getUserInfo` endpoint with that user id — id_type is NOT sent in the request. Images are limited to WOW_MAX_IMAGE_MB (default 5 MB).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://localhost:8083", "type": "string" },
+    { "key": "app_id", "value": "", "type": "string" },
+    { "key": "app_password", "value": "", "type": "string" },
+    { "key": "token", "value": "eyJhbGci...", "type": "string" },
+    { "key": "student_token", "value": "eyJhbGci... (DU access_token of a STUDENT user)", "type": "string" },
+    { "key": "employee_token", "value": "eyJhbGci... (DU access_token of an EMPLOYEE/faculty user)", "type": "string" },
+    { "key": "student_id", "value": "550e8400-e29b-41d4-a716-446655440000", "type": "string" },
+    { "key": "employee_emp_id", "value": "EMP-1024", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "1. Enroll (Student)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "X-App-Id", "value": "{{app_id}}" },
+          { "key": "X-App-Password", "value": "{{app_password}}" },
+          { "key": "Authorization", "value": "Bearer {{student_token}}" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/ext-api/wow-attendance/enroll?id={{student_id}}",
+          "host": ["{{base_url}}"],
+          "path": ["ext-api", "wow-attendance", "enroll"],
+          "query": [
+            { "key": "id", "value": "{{student_id}}" }
+          ]
+        },
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            { "key": "id", "value": "{{student_id}}", "type": "text" },
+            { "key": "device_info", "value": "{\"device\":\"Android\",\"os\":\"14\",\"app_version\":\"2.1.0\"}", "type": "text" },
+            { "key": "images", "type": "file", "src": [] },
+            { "key": "images", "type": "file", "src": [] }
+          ]
+        },
+        "description": "id_type is resolved from the token's user via the DU getUserInfo endpoint, so send the DU access_token of a STUDENT user (student_token) and do NOT send id_type. `id` may be a query param OR form field. device_info (optional JSON string) and one-or-more `images` files go in the multipart body; each image must be <= WOW_MAX_IMAGE_MB (default 5 MB). The enrollment is persisted only after the AI platform confirms success — otherwise it fails closed (502) and nothing is saved."
+      }
+    },
+    {
+      "name": "1b. Enroll (Employee)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "X-App-Id", "value": "{{app_id}}" },
+          { "key": "X-App-Password", "value": "{{app_password}}" },
+          { "key": "Authorization", "value": "Bearer {{employee_token}}" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/ext-api/wow-attendance/enroll?id={{employee_emp_id}}",
+          "host": ["{{base_url}}"],
+          "path": ["ext-api", "wow-attendance", "enroll"],
+          "query": [
+            { "key": "id", "value": "{{employee_emp_id}}" }
+          ]
+        },
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            { "key": "id", "value": "{{employee_emp_id}}", "type": "text" },
+            { "key": "device_info", "value": "{\"device\":\"iPhone\",\"os\":\"17\"}", "type": "text" },
+            { "key": "images", "type": "file", "src": [] }
+          ]
+        },
+        "description": "For Employee, `id` is the faculty emp_id (matches lms_faculty.emp_id). id_type is resolved from the token's user via the DU getUserInfo endpoint, so send the DU access_token of an EMPLOYEE/faculty user (employee_token) and do NOT send id_type. `id` may be a query param OR form field."
+      }
+    },
+    {
+      "name": "2. Enrolled List",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "X-App-Id", "value": "{{app_id}}" },
+          { "key": "X-App-Password", "value": "{{app_password}}" },
+          { "key": "Authorization", "value": "Bearer {{token}}" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/ext-api/wow-attendance/enrolled?id_type=Student",
+          "host": ["{{base_url}}"],
+          "path": ["ext-api", "wow-attendance", "enrolled"],
+          "query": [
+            { "key": "id_type", "value": "Student" }
+          ]
+        },
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            { "key": "id_type", "value": "Student", "type": "text" },
+            { "key": "page", "value": "1", "type": "text" },
+            { "key": "limit", "value": "20", "type": "text" }
+          ]
+        },
+        "description": "Requires the Authorization: Bearer header. id_type may be sent as a query param OR form field (both included here). page/limit optional (default 1 / 20)."
+      }
+    },
+    {
+      "name": "2b. Check Enrolled",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "X-App-Id", "value": "{{app_id}}" },
+          { "key": "X-App-Password", "value": "{{app_password}}" },
+          { "key": "Authorization", "value": "Bearer {{token}}" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/ext-api/wow-attendance/check?person_id={{employee_emp_id}}",
+          "host": ["{{base_url}}"],
+          "path": ["ext-api", "wow-attendance", "check"],
+          "query": [
+            { "key": "person_id", "value": "{{employee_emp_id}}" }
+          ]
+        },
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            { "key": "person_id", "value": "{{employee_emp_id}}", "type": "text" }
+          ]
+        },
+        "description": "Read-only check: returns whether person_id has an active enrollment. Requires the Authorization: Bearer header. person_id may be sent as a query param OR form field (alias `id` also accepted; both shown here). success is true when enrolled, false when not (the `enrolled` flag mirrors it); HTTP is 200 either way."
+      }
+    },
+    {
+      "name": "2c. Report — by date range",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "X-App-Id", "value": "{{app_id}}" },
+          { "key": "X-App-Password", "value": "{{app_password}}" },
+          { "key": "Authorization", "value": "Bearer {{token}}" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/ext-api/wow-attendance/reports/by-date?from_date=2026-06-01&to_date=2026-06-21",
+          "host": ["{{base_url}}"],
+          "path": ["ext-api", "wow-attendance", "reports", "by-date"],
+          "query": [
+            { "key": "from_date", "value": "2026-06-01" },
+            { "key": "to_date", "value": "2026-06-21" }
+          ]
+        },
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            { "key": "from_date", "value": "2026-06-01", "type": "text" },
+            { "key": "to_date", "value": "2026-06-21", "type": "text" },
+            { "key": "id_type", "value": "Employee", "type": "text", "disabled": true },
+            { "key": "page", "value": "1", "type": "text" },
+            { "key": "limit", "value": "20", "type": "text" }
+          ]
+        },
+        "description": "Attendance records whose created_at date is within [from_date, to_date] inclusive. Requires the Authorization: Bearer header. Dates are YYYY-MM-DD; all fields may be query params OR form fields. Optional id_type filters to Student/Employee (disabled here = both). Paginated, newest first."
+      }
+    },
+    {
+      "name": "2d. Report — by person",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "X-App-Id", "value": "{{app_id}}" },
+          { "key": "X-App-Password", "value": "{{app_password}}" },
+          { "key": "Authorization", "value": "Bearer {{token}}" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/ext-api/wow-attendance/reports/by-person?person_id={{employee_emp_id}}&from_date=2026-06-01&to_date=2026-06-21",
+          "host": ["{{base_url}}"],
+          "path": ["ext-api", "wow-attendance", "reports", "by-person"],
+          "query": [
+            { "key": "person_id", "value": "{{employee_emp_id}}" },
+            { "key": "from_date", "value": "2026-06-01" },
+            { "key": "to_date", "value": "2026-06-21" }
+          ]
+        },
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            { "key": "person_id", "value": "{{employee_emp_id}}", "type": "text" },
+            { "key": "from_date", "value": "2026-06-01", "type": "text" },
+            { "key": "to_date", "value": "2026-06-21", "type": "text" },
+            { "key": "page", "value": "1", "type": "text" },
+            { "key": "limit", "value": "20", "type": "text" }
+          ]
+        },
+        "description": "One person's attendance records within [from_date, to_date] inclusive. Requires the Authorization: Bearer header. person_id may be query param or form field (alias `id`). Dates are YYYY-MM-DD. Paginated, newest first."
+      }
+    },
+    {
+      "name": "3. Verify & Mark Attendance",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "X-App-Id", "value": "{{app_id}}" },
+          { "key": "X-App-Password", "value": "{{app_password}}" },
+          { "key": "Authorization", "value": "Bearer {{token}}" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/ext-api/wow-attendance/verify?id={{student_id}}&id_type=Student",
+          "host": ["{{base_url}}"],
+          "path": ["ext-api", "wow-attendance", "verify"],
+          "query": [
+            { "key": "id", "value": "{{student_id}}" },
+            { "key": "id_type", "value": "Student" }
+          ]
+        },
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            { "key": "id", "value": "{{student_id}}", "type": "text" },
+            { "key": "id_type", "value": "Student", "type": "text" },
+            { "key": "device_info", "value": "{\"device\":\"iPhone\",\"os\":\"17\"}", "type": "text" },
+            { "key": "image", "type": "file", "src": [] }
+          ]
+        },
+        "description": "1:1 verify. Requires the Authorization: Bearer header. id (optional 1:1 guard) and id_type (optional fallback) may be sent as query params OR form fields. The live photo field may be named image, images, file or photo; you may also send it as a base64 string in a Text field of the same name (a data:...;base64, prefix is stripped). Each image must be <= WOW_MAX_IMAGE_MB (default 5 MB). Matching runs against this person's enrolled images before the attendance record is written."
+      }
+    },
+    {
+      "name": "3b. Verify (1:N identify, no id)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "X-App-Id", "value": "{{app_id}}" },
+          { "key": "X-App-Password", "value": "{{app_password}}" },
+          { "key": "Authorization", "value": "Bearer {{token}}" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/ext-api/wow-attendance/verify",
+          "host": ["{{base_url}}"],
+          "path": ["ext-api", "wow-attendance", "verify"]
+        },
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            { "key": "device_info", "value": "{\"device\":\"iPhone\",\"os\":\"17\"}", "type": "text" },
+            { "key": "image", "type": "file", "src": [] }
+          ]
+        },
+        "description": "1:N identify. Requires the Authorization: Bearer header. No `id`/`id_type` is sent — the live image is matched against everyone enrolled, the AI platform returns the person's identifier and id_type, and attendance is marked for that person. The image field may be named image/images/file/photo, or a base64 Text field of the same name. Each image must be <= WOW_MAX_IMAGE_MB (default 5 MB). Returns { success:false, matched:false, message:'No matching enrolled person found' } when nobody matches."
+      }
+    }
+  ]
+}
