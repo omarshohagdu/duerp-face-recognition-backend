@@ -1,8 +1,21 @@
 # Deployment — duerp-attendance
 
-Runs as an ordinary Rust binary on its own port, behind the same reverse proxy
-as duerp-api. See [`MIGRATION.md`](MIGRATION.md) for the cutover order — this
-document covers the steady state.
+Runs as an ordinary Rust binary on its own port, behind **its own nginx
+vhost**, which also serves the admin frontend. Only `POST /login` is proxied
+back to duerp-api. See [`MIGRATION.md`](MIGRATION.md) for the cutover order —
+this document covers the steady state.
+
+Paths throughout assume this deployment root:
+
+| | |
+|---|---|
+| Service | `/var/www/face_recognition/duerp-face-recognition-backend` |
+| Frontend | `/var/www/face_recognition/duerp-face-recognition-frontend` |
+| Uploads | `/var/www/face_recognition/duerp-face-recognition-backend/uploads` |
+
+They must agree with `WOW_UPLOAD_DIR`, `WOW_UPLOADS_SERVE_DIR` and
+`WOW_LOG_DIR` in `.env`, and with `ReadWritePaths` in the unit file. Move the
+root and all four change together.
 
 ---
 
@@ -12,21 +25,55 @@ document covers the steady state.
 cargo build --release        # -> target/release/duerp-attendance
 ```
 
-## Database
-
-Apply in order. Against the existing shared database, `000`–`002` are no-ops
-and only `003` creates anything new.
+### Frontend
 
 ```bash
-for f in sql/000_ext_api_infra.sql sql/001_wow_attendance.sql \
-         sql/002_location_verify.sql sql/003_token_mismatch.sql; do
-  psql "$DATABASE_URL" -f "$f" || break
-done
+cd /var/www/face_recognition/duerp-face-recognition-frontend
+npm ci
+npm run build                # -> dist/  (~400 KB)
 ```
 
+`npm run build` loads `.env.production` on top of `.env`. That file blanks
+`VITE_ATTENDANCE_END_POINT`, so the bundle calls `/login`,
+`/ext-api/wow-attendance/*` and `/uploads/wow_attendance/*` as **relative**
+URLs against whatever origin serves it — which is why the vhost below has to
+serve the SPA and proxy the API, and why no CORS is needed.
+
+`VITE_*` values are inlined at build time. Changing `.env` on the server does
+nothing; rebuild instead.
+
+## Database
+
+The service owns its own schema, `attendance`. Only the shared ext-api
+infrastructure still lives in `ictcell`.
+
+```bash
+# 1. shared ext-api infrastructure (ictcell) — a no-op where duerp-api
+#    already created it.
+psql "$DATABASE_URL" -f sql/000_ext_api_infra.sql
+
+# 2. everything this service owns: 6 tables, the attendance.employees view
+#    and 10 functions, all under the `attendance` schema.
+psql "$DATABASE_URL" -v app_role=duerp_attendance \
+     -f docs/attendance_schema.sql
+```
+
+Both are idempotent — every statement is `CREATE ... IF NOT EXISTS` or
+`CREATE OR REPLACE`, so re-running changes nothing.
+
+`sql/001`–`sql/003` are the **superseded** `ictcell` originals, kept for
+reference and for reading the pre-cutover database. Do not apply them to a new
+deployment; `docs/attendance_schema.sql` is generated from them and is the
+current source of truth.
+
+Cutting over a database that already ran the `ictcell` version needs the data
+copied across as well — the commented appendix at the end of
+`docs/attendance_schema.sql` has the statements, in dependency order, with the
+sequence resets. Run it with the service stopped.
+
 The service needs `SELECT` on the identity tables (`employees`, `lms_student`,
-`lms_faculty`, `body`) and full DML on the `wow_attendance_*`, `buildings`,
-`body_building_mapping` and `ext_api_*` tables. It creates no tables at
+`lms_faculty`, `body`) in `ictcell`, full DML on everything in `attendance`,
+and full DML on the `ext_api_*` tables in `ictcell`. It creates no tables at
 runtime — schema changes are always an explicit `psql` run.
 
 ### Opening the IP allow-list
@@ -60,10 +107,10 @@ interchangeable:
 
 | Key | Points at | Why there |
 |---|---|---|
-| `WOW_UPLOAD_DIR` | `duerp-attendance/uploads/wow_attendance` | Face captures are this service's data; duerp-api never reads them. |
-| `WOW_UPLOADS_SERVE_DIR` | `duerp-attendance/uploads` | Parent of the above — the `/uploads` URL prefix supplies the rest. |
+| `WOW_UPLOAD_DIR` | `<root>/uploads/wow_attendance` | Face captures are this service's data; duerp-api never reads them. |
+| `WOW_UPLOADS_SERVE_DIR` | `<root>/uploads` | Parent of the above — the `/uploads` URL prefix supplies the rest. |
 | `WOW_PUBLIC_BASE_URL` | *(unset)* | Public origin used to build openable image URLs in the step logs. Leave unset when the service is reached directly, or when your proxy sets `X-Forwarded-Proto`/`-Host`. Set it when the proxy does neither, or the logs will carry `http://127.0.0.1:8083/...` links no admin can open. |
-| `WOW_LOG_DIR` | `duerp-attendance/uploads/log` | This service's own step logs, alongside its images. duerp-api's admin viewer still shows them: it reads this folder too, via `WOW_ATTENDANCE_LOG_DIR` in **duerp-api's** `.env`, which must name this same path. |
+| `WOW_LOG_DIR` | `<root>/uploads/log` | This service's own step logs, alongside its images. duerp-api's admin viewer still shows them: it reads this folder too, via `WOW_ATTENDANCE_LOG_DIR` in **duerp-api's** `.env`, which must name this same path. |
 
 The first two moved out of duerp-api on 2026-08-19; `WOW_LOG_DIR` did not.
 
@@ -80,9 +127,9 @@ Wants=network-online.target
 Type=simple
 User=www-data
 Group=www-data
-WorkingDirectory=/var/www/Rust/duerp/duerp-attendance
-EnvironmentFile=/var/www/Rust/duerp/duerp-attendance/.env
-ExecStart=/var/www/Rust/duerp/duerp-attendance/target/release/duerp-attendance
+WorkingDirectory=/var/www/face_recognition/duerp-face-recognition-backend
+EnvironmentFile=/var/www/face_recognition/duerp-face-recognition-backend/.env
+ExecStart=/var/www/face_recognition/duerp-face-recognition-backend/target/release/duerp-attendance
 Restart=on-failure
 RestartSec=5
 
@@ -92,7 +139,7 @@ RestartSec=5
 # duerp-api's unit needs READ access here so its /api/logs viewer can list these
 # files — reads are allowed by default under ProtectSystem, so nothing extra is
 # required there, but the two units must run as users that can traverse it.
-ReadWritePaths=/var/www/Rust/duerp/duerp-attendance/uploads
+ReadWritePaths=/var/www/face_recognition/duerp-face-recognition-backend/uploads
 ProtectSystem=full
 PrivateTmp=true
 NoNewPrivileges=true
@@ -109,44 +156,52 @@ journalctl -u duerp-attendance -f
 
 ## nginx
 
-Attendance paths go to `:8083`, everything else stays on duerp-api at `:8080`.
+Attendance gets its **own vhost**. It serves the admin SPA from disk, proxies
+the attendance API and face images to `:8083`, and forwards only `POST /login`
+to duerp-api on `:8080`.
 
 ```nginx
+# /etc/nginx/sites-available/attendance.du.ac.bd
+
 server {
     listen 80;
-    server_name erp.example.edu;
+    server_name attendance.du.ac.bd;
+    return 301 https://$host$request_uri;
+}
 
-    # Face captures are multi-megabyte; must be at least WOW_MAX_UPLOAD_MB.
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name attendance.du.ac.bd;
+
+    ssl_certificate     /etc/letsencrypt/live/attendance.du.ac.bd/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/attendance.du.ac.bd/privkey.pem;
+
+    # TLS is not optional here: getUserMedia and navigator.geolocation are both
+    # disabled outside a secure context, so an expired certificate takes
+    # check-in offline rather than just dropping the padlock.
+
+    root /var/www/face_recognition/duerp-face-recognition-frontend/dist;
+
+    # Face captures are multi-megabyte and an enrollment sends several in one
+    # request; must be at least WOW_MAX_UPLOAD_MB (default 25).
     client_max_body_size 30m;
 
-    # --- attendance service ---
-    location /ext-api/wow-attendance/ {
-        proxy_pass http://127.0.0.1:8083;
-        proxy_set_header Host              $host;
-        # Required: the ext-api IP allow-list checks this.
-        proxy_set_header X-Real-IP         $remote_addr;
-        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+    # ---- 1. deny directory indexes under /uploads/ -----------------------
+    # The service registers its static route with file listings ENABLED, so a
+    # bare directory URL returns a browsable index of every enrolled face.
+    # Regex locations are matched before prefix ones, so this shadows the
+    # proxy rules below without needing to sit above them.
+    location ~ ^/uploads/(.*/)?$ { return 404; }
 
-        # Image upload + AI round-trip. The service's own AI timeout is 30s;
-        # keep this comfortably above it so nginx is never the one to give up.
-        proxy_read_timeout  120s;
-        proxy_send_timeout  120s;
-        proxy_request_buffering off;
-    }
-
-    # Never expose the step logs — they carry tokens, client IPs and employee
-    # ids. Both services also block this internally; this is defence in depth.
-    # Keep this BEFORE the /uploads/wow_attendance/ rule below: nginx picks the
-    # longest matching prefix, and these two must not be reordered by accident.
+    # ---- 2. step logs: never served -------------------------------------
+    # They carry client IPs, employee ids, GPS and image paths. The service
+    # blocks this internally too; this is defence in depth. Keep it ABOVE the
+    # /uploads/wow_attendance/ rule — nginx picks the longest matching prefix
+    # and these two must not be reordered by accident.
     location /uploads/log { return 404; }
 
-    # --- face captures live with the attendance service ---
-    # Since 2026-08-19 `wow_attendance/` sits under duerp-attendance/uploads, so
-    # this prefix is served by :8083 while the rest of /uploads (lectures,
-    # course materials, notice-board attachments) stays on duerp-api. Without
-    # this rule every enrolled/live image 404s: duerp-api serves /uploads from a
-    # folder that no longer contains them.
+    # ---- 3. face images: served by the attendance service ----------------
     location /uploads/wow_attendance/ {
         proxy_pass http://127.0.0.1:8083;
         proxy_set_header Host              $host;
@@ -155,19 +210,80 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
-    # --- everything else: duerp-api ---
-    location / {
+    # ---- 4. attendance API ----------------------------------------------
+    location /ext-api/wow-attendance/ {
+        proxy_pass http://127.0.0.1:8083;
+        proxy_set_header Host              $host;
+        # Required: the ext-api IP allow-list reads this. Without it every
+        # request looks like it came from the proxy.
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Image upload + AI round-trip. The service allows the AI platform 30s;
+        # keep this comfortably above it so nginx is never the one to give up
+        # on a request that actually succeeded.
+        proxy_read_timeout  120s;
+        proxy_send_timeout  120s;
+        proxy_request_buffering off;
+    }
+
+    # ---- 5. login stays on duerp-api -------------------------------------
+    # Both services mint an identical token, so /login was never split out.
+    # The SPA posts it to its own origin, which on a dedicated vhost is this
+    # one — so it has to be forwarded explicitly. Exact match: nothing else
+    # under duerp-api is exposed here.
+    location = /login {
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host              $host;
         proxy_set_header X-Real-IP         $remote_addr;
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
+
+    # ---- 6. hashed build assets ------------------------------------------
+    # Vite fingerprints these, so they are safe to cache forever.
+    location /assets/ {
+        try_files $uri =404;
+        access_log off;
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # ---- 7. the SPA ------------------------------------------------------
+    # try_files is load-bearing: react-router owns /attendance/*, /face-setup
+    # and /login client-side, so a deep link or a refresh must return
+    # index.html rather than a filesystem 404.
+    location / {
+        try_files $uri $uri/ /index.html;
+        add_header Cache-Control "no-cache";
+    }
 }
 ```
 
-`POST /login` is intentionally **not** split out: both services mint an
-identical token, so leaving it on duerp-api is correct and needs no rule.
+```bash
+sudo ln -s /etc/nginx/sites-available/attendance.du.ac.bd /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+`attendance.du.ac.bd` is the confirmed production hostname; the certificate is
+issued for it and `server_name` must match. If it ever moves, only this file
+and the certificate change — the frontend needs no rebuild, because the bundle
+uses relative URLs.
+
+### Why this vhost and not a shared one
+
+The SPA is built with an empty `VITE_ATTENDANCE_END_POINT`, so it calls its own
+origin. That buys three things:
+
+- **No CORS.** The service ships `Cors::permissive()`, which should not face a
+  public network. Same-origin removes the need for it.
+- **No rebuild on a domain change.** `VITE_*` values are inlined at build time.
+- **One place to enforce the upload rules.** Body size, timeouts and the
+  `/uploads` denials all live in one server block.
+
+The cost is rule 5: `/login` must be forwarded by hand. Drop it and the SPA
+gets a 404 from its own vhost on every sign-in attempt.
 
 ### A bare 404 on `/ext-api/wow-attendance/*` means the proxy rule is missing
 
@@ -182,17 +298,22 @@ did reach it fails with a JSON envelope (`{"status":"error", …}`), never a bla
 404. The request above is well-formed; `verify` really does take `images` as a
 file part plus a `device_info` text part.
 
-What produces it: the request landed on **duerp-api (:8080)**, which no longer
-registers these routes, instead of on duerp-attendance (:8083). Check, in order:
+What produces it: the request never reached duerp-attendance (:8083). On the
+dedicated vhost it was most likely swallowed by rule 7 — the SPA catch-all
+returns `index.html` for anything unmatched, and an API client reading that as
+a failure reports a bare 404. Check, in order:
 
-1. The `location /ext-api/wow-attendance/ { … }` block above is present and
-   nginx was reloaded (`nginx -t && systemctl reload nginx`).
+1. The `location /ext-api/wow-attendance/ { … }` block is present and nginx was
+   reloaded (`nginx -t && systemctl reload nginx`).
 2. The trailing slash matches. `location /ext-api/wow-attendance/` does **not**
    match a request for `/ext-api/wow-attendance` with no trailing segment.
 3. duerp-attendance is actually up — `curl -s localhost:8083/health`.
-4. You are hitting the proxy, not `:8080` directly. Postman's `{{url}}` variable
+4. You are hitting the vhost, not duerp-api. Postman's `{{url}}` variable
    pointing at the old host:port is the single most common cause; against the
    service directly, `localhost:8083/ext-api/wow-attendance/verify` must answer.
+
+A **200 that returns HTML** instead of JSON is the same fault seen from the
+other side: the SPA catch-all answered, so the API rule did not match.
 
 A `403 IP address not allowed` instead means routing is fine and the ext-api
 allow-list is what rejected you — see [Opening the IP allow-list](#opening-the-ip-allow-list).

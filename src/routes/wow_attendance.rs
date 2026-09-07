@@ -442,7 +442,7 @@ async fn record_token_mismatch(
     log: &StepLogger,
 ) {
     let res = sqlx::query(
-        "INSERT INTO ictcell.wow_attendance_token_mismatch_record \
+        "INSERT INTO attendance.wow_attendance_token_mismatch_record \
              (action, ai_recognized_id, requested_user_id, ai_requested_id, ai_similarity) \
          VALUES ($1, $2, $3, $4, $5)",
     )
@@ -1598,9 +1598,9 @@ async fn wow_enroll_inner(
     log.step("AI enroll OK");
 
     // AI platform accepted the face — persist the enrollment.
-    log.step("persisting enrollment via ictcell.wow_attendance_enroll");
+    log.step("persisting enrollment via attendance.wow_attendance_enroll");
     let result = sqlx::query_scalar::<_, Value>(
-        "SELECT ictcell.wow_attendance_enroll($1, $2, $3, $4, $5)",
+        "SELECT attendance.wow_attendance_enroll($1, $2, $3, $4, $5)",
     )
     .bind(&id)
     .bind(&id_type)
@@ -1697,7 +1697,7 @@ pub async fn wow_enrolled_list(
     };
 
     let result = sqlx::query_scalar::<_, Value>(
-        "SELECT ictcell.wow_attendance_enrolled_list($1, $2, $3, $4)",
+        "SELECT attendance.wow_attendance_enrolled_list($1, $2, $3, $4)",
     )
     .bind(&id_type)
     .bind(&token)
@@ -1780,7 +1780,7 @@ pub async fn wow_check_enrolled(
     };
 
     let result = sqlx::query_scalar::<_, Value>(
-        "SELECT ictcell.wow_attendance_check_enrolled($1)",
+        "SELECT attendance.wow_attendance_check_enrolled($1)",
     )
     .bind(&person_id)
     .fetch_one(db.get_ref())
@@ -1878,7 +1878,7 @@ pub async fn wow_records_by_date(
     };
 
     let result = sqlx::query_scalar::<_, Value>(
-        "SELECT ictcell.wow_attendance_records_by_date($1, $2, $3, $4, $5)",
+        "SELECT attendance.wow_attendance_records_by_date($1, $2, $3, $4, $5)",
     )
     .bind(from)
     .bind(to)
@@ -1982,7 +1982,7 @@ pub async fn wow_records_by_person(
     };
 
     let result = sqlx::query_scalar::<_, Value>(
-        "SELECT ictcell.wow_attendance_records_by_person($1, $2, $3, $4, $5)",
+        "SELECT attendance.wow_attendance_records_by_person($1, $2, $3, $4, $5)",
     )
     .bind(&person_id)
     .bind(from)
@@ -2595,14 +2595,14 @@ async fn wow_verify_inner(
     };
     log.step(format!("resolved id_type={id_type} for id={id}"));
 
-    // Match the recognized person against ictcell.wow_attendance_enrollments:
+    // Match the recognized person against attendance.wow_attendance_enrollments:
     // the `person_id` returned by the face platform must exist as an active
     // enrollment. If it does not, the recognized identity is not enrolled here
     // and no attendance is recorded.
-    log.step(format!("matching recognized person_id={id} against ictcell.wow_attendance_enrollments"));
+    log.step(format!("matching recognized person_id={id} against attendance.wow_attendance_enrollments"));
     let enrolled: Result<Option<String>, _> = sqlx::query_scalar::<_, String>(
         "SELECT person_id \
-           FROM ictcell.wow_attendance_enrollments \
+           FROM attendance.wow_attendance_enrollments \
           WHERE person_id = $1 AND id_type = $2 AND is_active = true \
           ORDER BY enrolled_at DESC \
           LIMIT 1",
@@ -2663,12 +2663,12 @@ async fn wow_verify_inner(
             }
         };
         log.step(format!(
-            "checking location via ictcell.wow_attendance_location_verify \
+            "checking location via attendance.wow_attendance_location_verify \
              (lat={device_lat}, long={device_long})"
         ));
 
         let loc = sqlx::query_scalar::<_, Value>(
-            "SELECT ictcell.wow_attendance_location_verify($1, $2, $3)",
+            "SELECT attendance.wow_attendance_location_verify($1, $2, $3)",
         )
         .bind(&id)
         .bind(device_lat)
@@ -2713,9 +2713,9 @@ async fn wow_verify_inner(
     // /recognize does not return a numeric score; record 1.0 on a match.
     let confidence = 1.0_f64;
 
-    log.step("recording attendance via ictcell.wow_attendance_verify");
+    log.step("recording attendance via attendance.wow_attendance_verify");
     let result = sqlx::query_scalar::<_, Value>(
-        "SELECT ictcell.wow_attendance_verify($1, $2, $3, $4, $5, $6, $7)",
+        "SELECT attendance.wow_attendance_verify($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(&id)
     .bind(&id_type)
@@ -2895,9 +2895,9 @@ async fn wow_mapping_save_inner(
     }
     log.set_id(&body_code);
 
-    log.step("saving via ictcell.wow_attendance_body_building_mapping_save");
+    log.step("saving via attendance.wow_attendance_body_building_mapping_save");
     let result = sqlx::query_scalar::<_, Value>(
-        "SELECT ictcell.wow_attendance_body_building_mapping_save($1, $2, $3, $4, $5, $6, $7)",
+        "SELECT attendance.wow_attendance_body_building_mapping_save($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(&body_code)
     .bind(body.building_id)

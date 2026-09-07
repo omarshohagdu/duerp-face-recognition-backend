@@ -2,9 +2,10 @@
 //!
 //! Every test runs inside a transaction that is dropped without committing, so
 //! the database is left exactly as it was found. Fixtures are created inside
-//! that transaction; no test writes to `ictcell.employees` — an existing
-//! employee is borrowed instead, which also keeps the tests honest about the
-//! real `employees.office` shape.
+//! that transaction; no test writes to employee data — an existing employee is
+//! borrowed through `attendance.employees` (the read-only view over
+//! `ictcell.employees`), which keeps the tests honest about the real
+//! `employees.office` shape and fails loudly if that view ever goes missing.
 //!
 //! Requires `DATABASE_URL`. Without it every test skips rather than fails, so
 //! `cargo test` still works on a machine with no database.
@@ -53,13 +54,13 @@ macro_rules! db_or_skip {
 /// (emp_id, office). The office code is what mappings are keyed on.
 async fn borrow_employee(tx: &mut Transaction<'_, Postgres>) -> (String, String) {
     sqlx::query_as::<_, (String, String)>(
-        "SELECT emp_id, office FROM ictcell.employees
+        "SELECT emp_id, office FROM attendance.employees
           WHERE emp_id IS NOT NULL AND office IS NOT NULL AND btrim(office) <> ''
           LIMIT 1",
     )
     .fetch_one(&mut **tx)
     .await
-    .expect("no usable employee row found in ictcell.employees")
+    .expect("no usable employee row found in attendance.employees")
 }
 
 /// Insert an active building + mapping for `office` inside the transaction.
@@ -73,14 +74,14 @@ async fn map_building(
     is_active: bool,
 ) -> i32 {
     let building_id: i32 =
-        sqlx::query_scalar("INSERT INTO ictcell.buildings (name, status) VALUES ($1, 'Active') RETURNING id")
+        sqlx::query_scalar("INSERT INTO attendance.buildings (name, status) VALUES ($1, 'Active') RETURNING id")
             .bind(name)
             .fetch_one(&mut **tx)
             .await
             .expect("insert building");
 
     sqlx::query(
-        "INSERT INTO ictcell.body_building_mapping
+        "INSERT INTO attendance.body_building_mapping
              (body_code, building_id, lat, \"long\", radius, is_active)
          VALUES ($1, $2, $3, $4, $5, $6)",
     )
@@ -104,7 +105,7 @@ async fn verify(
     lat: f64,
     long: f64,
 ) -> Value {
-    sqlx::query_scalar::<_, Value>("SELECT ictcell.wow_attendance_location_verify($1, $2, $3)")
+    sqlx::query_scalar::<_, Value>("SELECT attendance.wow_attendance_location_verify($1, $2, $3)")
         .bind(emp_id)
         .bind(lat)
         .bind(long)
@@ -126,7 +127,7 @@ async fn save_mapping(
     is_active: Option<bool>,
 ) -> Value {
     sqlx::query_scalar::<_, Value>(
-        "SELECT ictcell.wow_attendance_body_building_mapping_save($1, $2, $3, $4, $5, $6, $7)",
+        "SELECT attendance.wow_attendance_body_building_mapping_save($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(body_code)
     .bind(building_id)
@@ -253,13 +254,13 @@ async fn null_coordinate_mapping_is_ignored() {
     let mut tx = pool.begin().await.unwrap();
     let (emp_id, office) = borrow_employee(&mut tx).await;
     let building_id: i32 = sqlx::query_scalar(
-        "INSERT INTO ictcell.buildings (name, status) VALUES ('Unsurveyed', 'Active') RETURNING id",
+        "INSERT INTO attendance.buildings (name, status) VALUES ('Unsurveyed', 'Active') RETURNING id",
     )
     .fetch_one(&mut *tx)
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO ictcell.body_building_mapping (body_code, building_id, lat, \"long\", radius, is_active)
+        "INSERT INTO attendance.body_building_mapping (body_code, building_id, lat, \"long\", radius, is_active)
          VALUES ($1, $2, NULL, NULL, 50, true)",
     )
     .bind(&office)
@@ -337,7 +338,7 @@ async fn save_creates_building_by_name_then_upserts() {
     assert_eq!(message(&updated), "Mapping updated", "got {updated}");
 
     let count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM ictcell.body_building_mapping WHERE body_code = $1 AND building_id = $2",
+        "SELECT count(*) FROM attendance.body_building_mapping WHERE body_code = $1 AND building_id = $2",
     )
     .bind(&office)
     .bind(building_id)
