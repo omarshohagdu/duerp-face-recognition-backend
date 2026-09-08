@@ -88,6 +88,11 @@ UPDATE ictcell.ext_api_allowed_ips
                     '/ext-api/wow-attendance/enroll');
 ```
 
+The admin screens call seven more endpoints from the SAME browser, so an IP that
+can check in cannot necessarily open the reports — each path needs its own row:
+`enrolled`, `check`, `reports/by-date`, `reports/by-person`, `mapping-save`,
+`logs/login` and `logs/attendance`.
+
 Behind a reverse proxy the recorded IP is whatever `X-Forwarded-For` resolves
 to, so the proxy **must** set it — otherwise every request appears to come from
 the proxy itself and the allow-list stops meaning anything.
@@ -113,6 +118,67 @@ interchangeable:
 | `WOW_LOG_DIR` | `<root>/uploads/log` | This service's own step logs, alongside its images. duerp-api's admin viewer still shows them: it reads this folder too, via `WOW_ATTENDANCE_LOG_DIR` in **duerp-api's** `.env`, which must name this same path. |
 
 The first two moved out of duerp-api on 2026-08-19; `WOW_LOG_DIR` did not.
+
+### Admin-gated endpoints and `WOW_ADMIN_KEY`
+
+These require a shared `X-Admin-Key` matching `WOW_ADMIN_KEY`, on top of the
+bearer token and the ext-api gate:
+
+| Endpoint | When the key is needed |
+|---|---|
+| `mapping-save` | always — it writes |
+| `reports/by-date` | always — no per-person scope exists |
+| `reports/by-person` | only when `person_id` is not the token's own `sub` |
+| `logs/login`, `logs/attendance` | always |
+
+**This is a breaking change for existing API clients.** Anything that read
+`by-date`, or read `by-person` for somebody other than its own token holder,
+now gets a `403` until it sends the key. Before deploying, check
+`ictcell.ext_api_call_logs` for who has been calling them:
+
+```sql
+SELECT client_ip, endpoint, count(*), max(created_at)
+  FROM ictcell.ext_api_call_logs
+ WHERE endpoint LIKE '/ext-api/wow-attendance/reports/%'
+   AND created_at > now() - interval '30 days'
+ GROUP BY 1, 2 ORDER BY 3 DESC;
+```
+
+**Unset is fail-closed, not open** — with no `WOW_ADMIN_KEY` these answer
+`503 Admin operations are not configured on this server`, which is what a
+"nothing saves and nothing loads" report from an admin usually means. Check it
+first:
+
+```bash
+systemctl show duerp-attendance -p Environment | tr ' ' '\n' | grep WOW_ADMIN_KEY
+```
+
+The SPA never stores this key: it asks the operator to paste it, holds it in
+memory for the tab, and drops it on sign-out. It is deliberately NOT a `VITE_`
+var — those are inlined into the bundle where any end user can read them.
+
+### The step-log viewers
+
+`/uploads/log` and `/uploads/login` stay 404 — at the nginx rules above AND
+inside the service (`main.rs` registers those blocks ahead of the static
+route). Nothing serves those files.
+
+The two admin screens read them through JSON endpoints instead:
+
+| Endpoint | Reads |
+|---|---|
+| `POST /ext-api/wow-attendance/logs/login` | `LOGIN_LOG_DIR` — one file per sign-in |
+| `POST /ext-api/wow-attendance/logs/attendance` | `WOW_LOG_DIR` — one file per enroll/verify/mapping-save |
+
+Both take `page`, `limit`, `person_id`, `from_date`, `to_date` as query params
+and return a listing; add `file=<name>` to read one file's content. The
+requested name is matched against the directory's own listing before it is
+opened, so a path outside the folder cannot be reached by naming it.
+
+Do not "simplify" this by dropping the `/uploads/log` blocks and letting the
+static route serve the folder. The files carry usernames, client IPs, GPS,
+employee ids and full request and response bodies; the whole point is that
+reaching one requires the admin key.
 
 ## systemd
 

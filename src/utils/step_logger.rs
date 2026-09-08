@@ -233,11 +233,14 @@ impl StepLogger {
         }
     }
 
-    // Same, with an explicit destination — lets tests assert the on-disk shape
-    // without touching `WOW_LOG_DIR`, which is process-global and would leak
-    // between tests running in parallel.
-    #[cfg(test)]
-    fn new_in(route: &str, dir: &str) -> Self {
+    /// Same, with an explicit destination folder.
+    ///
+    /// Two callers need it. Routes that keep their logs apart from the
+    /// wow-attendance stream name their own folder (`/login` writes into
+    /// `<uploads>/login`), and tests assert the on-disk shape without touching
+    /// `WOW_LOG_DIR` — that variable is process-global and would leak between
+    /// tests running in parallel.
+    pub fn new_in(route: &str, dir: &str) -> Self {
         let mut this = Self::new(route);
         this.dir = dir.to_string();
         this

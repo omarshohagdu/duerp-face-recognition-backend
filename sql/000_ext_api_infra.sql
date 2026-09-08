@@ -78,7 +78,12 @@ SELECT v.endpoint, '{127.0.0.1,::1}'::text[]
     ('/ext-api/wow-attendance/reports/by-date'),
     ('/ext-api/wow-attendance/reports/by-person'),
     ('/ext-api/wow-attendance/ssl_image_verfiy'),
-    ('/ext-api/wow-attendance/mapping-save')
+    ('/ext-api/wow-attendance/mapping-save'),
+    -- Admin-only log readers. They are gated by X-Admin-Key on top of this
+    -- list, but the middleware runs FIRST: without a row here every call to
+    -- them is a 403 before the key is ever looked at.
+    ('/ext-api/wow-attendance/logs/login'),
+    ('/ext-api/wow-attendance/logs/attendance')
   ) AS v(endpoint)
  WHERE NOT EXISTS (
     SELECT 1 FROM ictcell.ext_api_allowed_ips a

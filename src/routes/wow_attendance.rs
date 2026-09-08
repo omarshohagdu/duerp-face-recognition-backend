@@ -94,7 +94,7 @@ fn parse_report_date(s: &str) -> Option<chrono::NaiveDate> {
 // Extract the required attendance token from the `Authorization: Bearer <token>`
 // header. Returns Err(401 response) when the header is missing or the token is
 // empty. The token is no longer accepted as a multipart body field.
-fn require_bearer_token(req: &actix_web::HttpRequest) -> Result<String, HttpResponse> {
+pub(crate) fn require_bearer_token(req: &actix_web::HttpRequest) -> Result<String, HttpResponse> {
     req.headers()
         .get(actix_web::http::header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
@@ -204,6 +204,21 @@ fn user_from_token(token: &str) -> Result<TokenUser, HttpResponse> {
         }
         Err(e) if *e.kind() == ErrorKind::ExpiredSignature => Err(unauth("Token has expired")),
         Err(_) => Err(unauth("Invalid token")),
+    }
+}
+
+// Is `requested` the same person as the token's `sub`?
+//
+// Compared numerically when both sides parse, because the two are not written
+// the same way: the token carries `sub` as a number (leading zeros gone) while
+// a caller sends the id as text. A staff id of "0202011007" would fail a naive
+// string compare against a `sub` of 202011007 and lock that person out of
+// their own records.
+fn same_person(requested: &str, token_sub: i64) -> bool {
+    let requested = requested.trim();
+    match requested.parse::<i64>() {
+        Ok(n) => n == token_sub,
+        Err(_) => requested == token_sub.to_string(),
     }
 }
 
@@ -574,7 +589,7 @@ fn public_base_url(req: &actix_web::HttpRequest) -> String {
 // The path as called, query string included — what a reader needs to reproduce
 // the request. `HttpRequest::uri()` already carries both, but the query is
 // optional, so it is rebuilt rather than unwrapped.
-fn full_path(req: &actix_web::HttpRequest) -> String {
+pub(crate) fn full_path(req: &actix_web::HttpRequest) -> String {
     let path = req.path();
     match req.query_string() {
         "" => path.to_string(),
@@ -588,7 +603,7 @@ fn full_path(req: &actix_web::HttpRequest) -> String {
 // makes every one of them land in the log, rather than only the success path.
 // The body is buffered to read it, then rebuilt byte-for-byte with the original
 // status and content type.
-async fn log_local_response(log: &StepLogger, resp: HttpResponse) -> HttpResponse {
+pub(crate) async fn log_local_response(log: &StepLogger, resp: HttpResponse) -> HttpResponse {
     let status = resp.status();
     let content_type = resp
         .headers()
@@ -1813,6 +1828,14 @@ pub async fn wow_records_by_date(
     if let Err(resp) = require_bearer_token(&req) {
         return resp;
     }
+    // This report has no per-person scope — it returns every check-in the
+    // university made in the range — so there is no "your own" version of it to
+    // fall back to the way `by-person` does. A valid token alone used to be
+    // enough, which meant anyone who could sign in could read everyone's
+    // movements. It is an admin report; it takes the admin key.
+    if let Err(resp) = require_admin_key(&req) {
+        return resp;
+    }
 
     let mut from_date = query.from_date.clone().filter(|s| !s.trim().is_empty());
     let mut to_date = query.to_date.clone().filter(|s| !s.trim().is_empty());
@@ -1912,9 +1935,10 @@ pub async fn wow_records_by_person(
     query: web::Query<RecordsByPersonQuery>,
     mut payload: Multipart,
 ) -> HttpResponse {
-    if let Err(resp) = require_bearer_token(&req) {
-        return resp;
-    }
+    let token = match require_bearer_token(&req) {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
 
     let mut person_id = query.person_id.clone().filter(|s| !s.trim().is_empty());
     let mut from_date = query.from_date.clone().filter(|s| !s.trim().is_empty());
@@ -1980,6 +2004,28 @@ pub async fn wow_records_by_person(
                 .json(json!({ "success": false, "message": "Invalid `to_date`; expected YYYY-MM-DD" }));
         }
     };
+
+    // Whose records these are. Reading somebody else's attendance is an admin
+    // act, so it takes the admin key; reading your own takes only your token.
+    //
+    // Without this the endpoint answered for ANY `person_id` a valid token
+    // asked for, which is how the self-service "My attendance" screen would
+    // have become a way to read a colleague's movements by editing one field.
+    let caller = match user_from_token(&token) {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+    if !same_person(&person_id, caller.person_id) {
+        // Returns 403 for a wrong key and 503 when WOW_ADMIN_KEY is unset, so
+        // "you may not" and "the server cannot tell" stay distinguishable.
+        if let Err(resp) = require_admin_key(&req) {
+            return resp;
+        }
+    }
+    // Bind what was checked. `same_person` compares the trimmed id, so binding
+    // the raw one would let " 2020111007 " pass the ownership check and then
+    // match no rows — an empty report that looks like "you have no attendance".
+    let person_id = person_id.trim().to_string();
 
     let result = sqlx::query_scalar::<_, Value>(
         "SELECT attendance.wow_attendance_records_by_person($1, $2, $3, $4, $5)",
@@ -2765,7 +2811,7 @@ async fn wow_verify_inner(
 // The key is shared, so it identifies "someone holding the key", not a person;
 // callers are logged with the token's `sub` so a write can still be traced back
 // to a login. Replace this with a role claim once the token carries one.
-fn require_admin_key(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
+pub(crate) fn require_admin_key(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     let configured = match std::env::var("WOW_ADMIN_KEY") {
         Ok(v) if !v.trim().is_empty() => v,
         // Fail closed: with no key configured the endpoint is unusable rather
@@ -2800,6 +2846,22 @@ fn require_admin_key(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
         })));
     }
     Ok(())
+}
+
+// Bearer token + admin key in one call, for endpoints where BOTH are required
+// and neither identifies a person on its own.
+//
+// Order matters: the token is validated first so an expired session reports as
+// a 401 the SPA can act on (re-login), rather than as a 403 that looks like a
+// wrong admin key. Returns the token's `sub` so the caller can be named in a
+// log line — the key itself is shared and identifies nobody.
+pub(crate) fn require_admin_caller(
+    req: &actix_web::HttpRequest,
+) -> Result<i64, HttpResponse> {
+    let token = require_bearer_token(req)?;
+    let user = user_from_token(&token)?;
+    require_admin_key(req)?;
+    Ok(user.person_id)
 }
 
 // Serialize is derived only so the request can be echoed into the step log as

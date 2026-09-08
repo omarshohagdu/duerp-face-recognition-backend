@@ -70,16 +70,23 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(db_pool.clone()))
             .wrap(actix_cors::Cors::permissive())
             .route("/health", web::get().to(health))
-            // Step logs live at `<uploads>/log` so they ride the same mounted
-            // volume as the images. That puts them inside the folder the
-            // `/uploads` static route serves, so this MUST be registered BEFORE
-            // that route to shadow it: the logs carry tokens, client IPs and
-            // employee ids and must never be reachable over HTTP.
+            // Step logs live at `<uploads>/log` (attendance calls) and
+            // `<uploads>/login` (sign-ins) so they ride the same mounted volume
+            // as the images. That puts them inside the folder the `/uploads`
+            // static route serves, so these MUST be registered BEFORE that
+            // route to shadow it: the logs carry tokens, client IPs, usernames
+            // and employee ids and must never be reachable over HTTP.
+            //
+            // Both forms are covered for each: the bare path (which the static
+            // server would otherwise 301-redirect to the listing, revealing the
+            // folder) and everything beneath it.
             .service(
-                // Both forms: the bare path (which the static server would
-                // otherwise 301-redirect to the listing, revealing the folder)
-                // and everything beneath it.
                 web::scope("/uploads/log").default_service(
+                    web::route().to(|| async { HttpResponse::NotFound().finish() }),
+                ),
+            )
+            .service(
+                web::scope("/uploads/login").default_service(
                     web::route().to(|| async { HttpResponse::NotFound().finish() }),
                 ),
             )
@@ -101,6 +108,14 @@ async fn main() -> std::io::Result<()> {
                     .service(routes::wow_attendance::wow_ssl_image_verify)  // POST /ext-api/wow-attendance/ssl_image_verfiy (images: multiple file)
                     .service(routes::wow_attendance::wow_verify)         // POST /ext-api/wow-attendance/verify?id=&id_type=
                     .service(routes::wow_attendance::wow_mapping_save)   // POST /ext-api/wow-attendance/mapping-save (admin; json: body_code, building_id|building_name, lat, long, radius)
+                    // Admin-only readers for the two step-log folders. They sit
+                    // here rather than on their own scope so they inherit the
+                    // app-credential + IP allow-list gate every other ext-api
+                    // call gets; each additionally requires `X-Admin-Key`.
+                    // The `/uploads/log` and `/uploads/login` 404 blocks above
+                    // stay — these serve JSON, never the files.
+                    .service(routes::logs::wow_login_logs)      // POST /ext-api/wow-attendance/logs/login?file=&person_id=&from_date=&to_date=&page=&limit=
+                    .service(routes::logs::wow_attendance_logs) // POST /ext-api/wow-attendance/logs/attendance?file=&person_id=&from_date=&to_date=&page=&limit=
             )
     })
     .bind((bind_addr, port))?

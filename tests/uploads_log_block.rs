@@ -1,19 +1,25 @@
-//! The step logs live under `<uploads>/log`, inside the folder the `/uploads`
-//! static route serves. They carry tokens, client IPs and employee ids, so they
+//! The step logs live under `<uploads>/log` (attendance calls) and
+//! `<uploads>/login` (sign-ins), inside the folder the `/uploads` static route
+//! serves. They carry tokens, client IPs, usernames and employee ids, so they
 //! must never be reachable over HTTP. This test reproduces the exact service
-//! wiring from main.rs — the block scope registered BEFORE the Files service —
+//! wiring from main.rs — the block scopes registered BEFORE the Files service —
 //! and asserts the logs are shadowed while ordinary uploads still serve.
 
 use actix_files::Files;
 use actix_web::{test, web, App, HttpResponse};
 use std::io::Write;
 
-// Mirror of the two services in main.rs, in the same registration order.
+// Mirror of the three services in main.rs, in the same registration order.
 macro_rules! build_app {
     ($serve_dir:expr) => {
         App::new()
             .service(
                 web::scope("/uploads/log").default_service(
+                    web::route().to(|| async { HttpResponse::NotFound().finish() }),
+                ),
+            )
+            .service(
+                web::scope("/uploads/login").default_service(
                     web::route().to(|| async { HttpResponse::NotFound().finish() }),
                 ),
             )
@@ -27,10 +33,13 @@ macro_rules! build_app {
 
 #[actix_web::test]
 async fn logs_are_not_reachable_but_uploads_are() {
-    // A temp uploads dir with a normal image and a log file underneath log/.
+    // A temp uploads dir with a normal image and a log file under each of the
+    // two log folders.
     let dir = std::env::temp_dir().join(format!("uploads_block_{}", std::process::id()));
     let log_dir = dir.join("log");
+    let login_dir = dir.join("login");
     std::fs::create_dir_all(&log_dir).unwrap();
+    std::fs::create_dir_all(&login_dir).unwrap();
     std::fs::File::create(dir.join("face.jpg"))
         .unwrap()
         .write_all(b"not-really-a-jpeg")
@@ -38,6 +47,10 @@ async fn logs_are_not_reachable_but_uploads_are() {
     std::fs::File::create(log_dir.join("2020_secret.log"))
         .unwrap()
         .write_all(b"token user id=45320 client_ip=1.2.3.4")
+        .unwrap();
+    std::fs::File::create(login_dir.join("2020_secret.log"))
+        .unwrap()
+        .write_all(b"username=someone@du.ac.bd client_ip=1.2.3.4")
         .unwrap();
 
     let app = test::init_service(build_app!(dir.clone())).await;
@@ -57,6 +70,13 @@ async fn logs_are_not_reachable_but_uploads_are() {
     // The bare folder path must not redirect to a listing either.
     let resp = test::call_service(&app, test::TestRequest::get().uri("/uploads/log").to_request()).await;
     assert_eq!(resp.status().as_u16(), 404, "bare log path must be blocked, not redirected (got {})", resp.status());
+
+    // Same three shapes for the login logs, which sit in a sibling folder and
+    // are covered by their own block rather than by the `/uploads/log` one.
+    for uri in ["/uploads/login/2020_secret.log", "/uploads/login/", "/uploads/login"] {
+        let resp = test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+        assert_eq!(resp.status().as_u16(), 404, "{uri} must be blocked, got {}", resp.status());
+    }
 
     std::fs::remove_dir_all(&dir).ok();
 }

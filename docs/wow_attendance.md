@@ -554,6 +554,12 @@ Lists attendance records from `ictcell.wow_attendance_records` whose `created_at
 **date** falls within `[from_date, to_date]` inclusive, newest first, paginated.
 Each record's person name is resolved from `lms_student` / `lms_faculty`.
 
+> **Requires `X-Admin-Key`** (matching `WOW_ADMIN_KEY`), on top of the bearer
+> token. This report covers the whole university and has no per-person scope, so
+> there is no version of it a caller is entitled to by their own token alone.
+> `403 {"success":false,"message":"Valid \`X-Admin-Key\` header required for this
+> operation"}` without it; `503` when the server has no key configured.
+
 **Body — form-data** (all fields may also be sent as query params)
 
 | Field       | Type | Required | Description                                  |
@@ -612,6 +618,15 @@ curl -X POST \
 Same as the by-date report but scoped to a single `person_id`. The person's
 resolved `name` is returned once at the top level; each list item omits the
 repeated `id`/`name`.
+
+> **`person_id` must be the token's own `sub`, or the call must carry
+> `X-Admin-Key`.** Reading your own attendance needs only your token; reading
+> anyone else's is an admin act. Ids are compared numerically, so leading zeros
+> and surrounding spaces do not matter.
+>
+> A caller on a legacy DU token is always treated as "someone else" here: that
+> token's `sub` is the DU `user_id`, which never equals a 10-digit `emp_id`. Such
+> clients must send the admin key or migrate to this service's `POST /login`.
 
 **Body — form-data** (all fields may also be sent as query params)
 
