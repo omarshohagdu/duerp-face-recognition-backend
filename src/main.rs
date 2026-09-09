@@ -116,6 +116,13 @@ async fn main() -> std::io::Result<()> {
                     // stay — these serve JSON, never the files.
                     .service(routes::logs::wow_login_logs)      // POST /ext-api/wow-attendance/logs/login?file=&person_id=&from_date=&to_date=&page=&limit=
                     .service(routes::logs::wow_attendance_logs) // POST /ext-api/wow-attendance/logs/attendance?file=&person_id=&from_date=&to_date=&page=&limit=
+                    // NFC card <-> student mapping. Same gate as everything
+                    // else in this scope (app credentials + IP allow-list) plus
+                    // a bearer token; no admin key — see src/routes/nfc_card.rs.
+                    // Both paths need their own `ext_api_allowed_ips` row, added
+                    // by sql/004_nfc_card.sql, or every call is a 403.
+                    .service(routes::nfc_card::nfc_get_card_info)  // GET|POST /ext-api/nfc-card/get_card_info?card_number= (or in the body)
+                    .service(routes::nfc_card::nfc_save_card_info) // POST /ext-api/nfc-card/save_card_info (multipart: student_applicant_id, card_number, is_verified, registration_type, force_reassign, card_image, student_selfie)
             )
     })
     .bind((bind_addr, port))?

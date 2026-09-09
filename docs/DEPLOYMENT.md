@@ -52,8 +52,8 @@ infrastructure still lives in `ictcell`.
 #    already created it.
 psql "$DATABASE_URL" -f sql/000_ext_api_infra.sql
 
-# 2. everything this service owns: 6 tables, the attendance.employees view
-#    and 10 functions, all under the `attendance` schema.
+# 2. everything this service owns: 8 tables, the attendance.employees view
+#    and 14 functions, all under the `attendance` schema.
 psql "$DATABASE_URL" -v app_role=duerp_attendance \
      -f docs/attendance_schema.sql
 ```
@@ -65,6 +65,12 @@ Both are idempotent — every statement is `CREATE ... IF NOT EXISTS` or
 reference and for reading the pre-cutover database. Do not apply them to a new
 deployment; `docs/attendance_schema.sql` is generated from them and is the
 current source of truth.
+
+`sql/004_nfc_card.sql` is different: it targets the current `attendance` schema
+and is the incremental migration for the NFC card module, for an existing
+deployment that does not want to re-run the whole schema file. Its objects are
+already in `docs/attendance_schema.sql` (section 5), so step 2 above covers a
+fresh deployment on its own. See [`nfc_card.md`](nfc_card.md).
 
 Cutting over a database that already ran the `ictcell` version needs the data
 copied across as well — the commented appendix at the end of
@@ -92,6 +98,12 @@ The admin screens call seven more endpoints from the SAME browser, so an IP that
 can check in cannot necessarily open the reports — each path needs its own row:
 `enrolled`, `check`, `reports/by-date`, `reports/by-person`, `mapping-save`,
 `logs/login` and `logs/attendance`.
+
+The NFC card reader is a separate client on separate paths, so it needs its own
+two rows — `/ext-api/nfc-card/get_card_info` and
+`/ext-api/nfc-card/save_card_info`. Keep these tight: `save_card_info` takes no
+admin key, so any token holder calling from an allow-listed IP can reassign a
+card. See [`nfc_card.md`](nfc_card.md#auth).
 
 Behind a reverse proxy the recorded IP is whatever `X-Forwarded-For` resolves
 to, so the proxy **must** set it — otherwise every request appears to come from

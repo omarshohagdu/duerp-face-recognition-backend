@@ -532,7 +532,7 @@ fn live_dir() -> String {
 // an operator needs on the box, this is what an admin needs from the log viewer,
 // and after the 2026-08-19 move they are no longer trivially derivable from one
 // another (face images live under duerp-attendance/uploads, served at :8083).
-fn browsable_path(fs_path: &str) -> Option<String> {
+pub(crate) fn browsable_path(fs_path: &str) -> Option<String> {
     let serve_dir = std::env::var("WOW_UPLOADS_SERVE_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -575,7 +575,7 @@ fn url_escape(path: &str) -> String {
 // it, fall back to how this request arrived — `connection_info` honours
 // X-Forwarded-Proto/Host, so a correctly configured proxy still yields the
 // public origin.
-fn public_base_url(req: &actix_web::HttpRequest) -> String {
+pub(crate) fn public_base_url(req: &actix_web::HttpRequest) -> String {
     if let Ok(v) = std::env::var("WOW_PUBLIC_BASE_URL") {
         let v = v.trim().trim_end_matches('/');
         if !v.is_empty() {
@@ -669,7 +669,7 @@ fn ai_target_bytes() -> usize {
 // to the AI platform, so this only guards against unbounded uploads — it is
 // deliberately larger than the AI limit. Configurable via WOW_MAX_UPLOAD_MB
 // (megabytes, may be fractional); defaults to 25 MB.
-fn max_upload_bytes() -> usize {
+pub(crate) fn max_upload_bytes() -> usize {
     std::env::var("WOW_MAX_UPLOAD_MB")
         .ok()
         .and_then(|s| s.trim().parse::<f64>().ok())
@@ -682,7 +682,7 @@ fn max_upload_bytes() -> usize {
 }
 
 // Human-friendly MB figure for the upload ceiling, for error messages.
-fn max_upload_mb_display() -> String {
+pub(crate) fn max_upload_mb_display() -> String {
     let mb = max_upload_bytes() as f64 / (1024.0 * 1024.0);
     if (mb.fract()).abs() < f64::EPSILON {
         format!("{} MB", mb as u64)
@@ -906,7 +906,7 @@ async fn ai_delete_person(
 // independent of the filename extension the client claimed. Used to log what a
 // phone actually uploads — Android frequently captures HEIC, which the AI
 // platform can't read.
-fn detect_image_format(head: &[u8]) -> &'static str {
+pub(crate) fn detect_image_format(head: &[u8]) -> &'static str {
     if head.len() >= 3 && head[0] == 0xFF && head[1] == 0xD8 && head[2] == 0xFF {
         "JPEG"
     } else if head.len() >= 8 && head[..8] == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
@@ -934,7 +934,7 @@ fn detect_image_format(head: &[u8]) -> &'static str {
 // non-image uploads (PDFs, videos, arbitrary files) before they are forwarded
 // to the AI platform. Relies on the magic number, not the client-supplied
 // filename/Content-Type, so it can't be fooled by a renamed file.
-fn is_supported_image(head: &[u8]) -> bool {
+pub(crate) fn is_supported_image(head: &[u8]) -> bool {
     !matches!(detect_image_format(head), "EMPTY (0 bytes)" | "UNKNOWN/non-image")
 }
 
@@ -1117,7 +1117,7 @@ fn compress_to_fit(bytes: Vec<u8>, max_bytes: usize) -> (Vec<u8>, bool) {
 // keeps the same reduced image the AI platform receives. Files already within
 // the limit, or that can't be decoded/compressed, are left untouched and their
 // original path returned.
-async fn reduce_saved_image(path: &str) -> String {
+pub(crate) async fn reduce_saved_image(path: &str) -> String {
     let bytes = match tokio::fs::read(path).await {
         Ok(b) => b,
         Err(e) => {
@@ -2862,6 +2862,24 @@ pub(crate) fn require_admin_caller(
     let user = user_from_token(&token)?;
     require_admin_key(req)?;
     Ok(user.person_id)
+}
+
+// Bearer token only, for endpoints that need a valid login but no admin role.
+//
+// Returns the token's `sub` together with the one-line description of WHICH
+// token source it arrived on. Callers log that line: it is how a caller still
+// on the legacy DU token gets spotted before `WOW_ACCEPT_DU_TOKEN` is turned
+// off, and a new endpoint that skipped it would be invisible in that sweep.
+//
+// `TokenUser` stays private — the id and the log line are everything a handler
+// outside this module needs, and exposing the type would invite duplicating
+// the validation rather than calling it.
+pub(crate) fn require_token_caller(
+    req: &actix_web::HttpRequest,
+) -> Result<(i64, String), HttpResponse> {
+    let token = require_bearer_token(req)?;
+    let user = user_from_token(&token)?;
+    Ok((user.person_id, token_step(&user)))
 }
 
 // Serialize is derived only so the request can be echoed into the step log as

@@ -76,11 +76,17 @@ writes are listed below; it only *reads* the identity tables.
 | `wow_attendance_records` | duerp-attendance | read + write |
 | `wow_attendance_token_mismatch_record` | duerp-attendance | write (audit) |
 | `buildings`, `body_building_mapping` | duerp-attendance | read + write (`mapping-save`) |
+| `nfc_student_cards` | duerp-attendance | read + write (`nfc-card/*`) |
+| `nfc_card_audit` | duerp-attendance | write (audit) |
 | `ext_api_allowed_ips`, `ext_api_call_logs` | shared | read / append |
 | `employees`, `lms_student`, `lms_faculty`, `body` | duerp-api / DU sync | **read only** |
 
-Nothing in duerp-api writes the `wow_attendance_*` tables, so there is no
-write-conflict between the two processes.
+Nothing in duerp-api writes the `wow_attendance_*` or `nfc_*` tables, so there
+is no write-conflict between the two processes.
+
+`nfc_student_cards` keys on an opaque `student_applicant_id` with no foreign
+key, because no applicant registry exists in the database to reference — see
+[`nfc_card.md`](nfc_card.md#student_applicant_id-has-no-foreign-key).
 
 ---
 
