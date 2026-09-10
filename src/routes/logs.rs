@@ -1,4 +1,4 @@
-//! Admin-only readers for the two step-log folders.
+//! Readers for the two step-log folders.
 //!
 //! WHY THESE EXIST AT ALL, given `main.rs` 404s both folders over HTTP:
 //! `<uploads>/log` and `<uploads>/login` sit INSIDE the tree the `/uploads`
@@ -6,7 +6,11 @@
 //! anyone with a URL from browsing every sign-in and every face call. That
 //! block must stay exactly as it is. These handlers are the deliberate,
 //! *gated* way in: nothing is served as a file, every response is JSON built
-//! here, and each call must carry a valid bearer token AND `X-Admin-Key`.
+//! here, and each call must carry a valid bearer token.
+//!
+//! That token is now the whole gate. These endpoints also required an
+//! `X-Admin-Key` until it was removed, so any account that can sign in can
+//! read every line described below.
 //!
 //! Do not "simplify" this by relaxing the static route. The files carry
 //! usernames, client IPs, GPS coordinates, employee ids and full request and
@@ -25,7 +29,7 @@ use actix_web::{post, web, HttpResponse};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::routes::wow_attendance::require_admin_caller;
+use crate::routes::wow_attendance::require_token_caller;
 
 /// Attendance step logs. Same default and env var `StepLogger` itself uses, so
 /// the reader can never point at a different folder than the writer.
@@ -284,7 +288,7 @@ fn read_one(dir: &str, requested: &str) -> HttpResponse {
 }
 
 fn handle(req: &actix_web::HttpRequest, dir: String, q: &LogQuery) -> HttpResponse {
-    if let Err(resp) = require_admin_caller(req) {
+    if let Err(resp) = require_token_caller(req) {
         return resp;
     }
     match q.file.as_deref().map(str::trim).filter(|s| !s.is_empty()) {

@@ -42,7 +42,7 @@ psql "$DATABASE_URL" -f duerp-attendance/sql/003_token_mismatch.sql    # audit t
 | New endpoint `POST /wow-attendance/verify` | Gate folded **into** the existing `POST /ext-api/wow-attendance/verify` | That path already exists (`wow_verify`, face recognition). Two handlers on one path means the second never runs. |
 | `employees.office` → `body_id INT` | `body_code varchar(50)` | `employees.office` holds `ictcell.body.body_code` (`'490010'`), **not** `body.body_id` (`'OES'`). Codes are zero-paddable, so an int column would break the join. |
 | Procedure returns raw `@msg` on `SQLEXCEPTION` | DB errors logged; caller gets a flat `"Internal server error"` | The spec's handler returned the raw message to the client, leaking schema internals. |
-| No auth | Bearer token + ownership check; admin writes need `X-Admin-Key` | The spec's handler read `emp_id` straight from the body, letting any caller probe which building any employee is mapped to. |
+| No auth | Bearer token | The spec's handler read `emp_id` straight from the body, letting any caller probe which building any employee is mapped to. The ownership check and the `X-Admin-Key` on writes that originally shipped here have since been removed. |
 | `radius numeric` parameter | `radius double precision` | The handler binds an `f64` → `float8`, and Postgres only has an **assignment** cast `float8 → numeric`. A `numeric` parameter fails resolution at runtime with *"function does not exist"* — invisible to `cargo check`, caught only against a real database. |
 
 The Haversine formula itself was correct and is unchanged in substance; it now uses
@@ -197,18 +197,22 @@ the geofence for every employee in an office.
 
 ### Authorization
 
-Three layers: `ExtAuthMiddleware` (app id/password + IP allow-list) → bearer token
-→ `X-Admin-Key` header matching the `WOW_ADMIN_KEY` env var.
+Two layers: `ExtAuthMiddleware` (app id/password + IP allow-list) → bearer token.
+
+> **Superseded.** This originally shipped with a third layer, an `X-Admin-Key`
+> header matching a `WOW_ADMIN_KEY` env var. That key has since been removed, so
+> `mapping-save` accepts any account that can sign in. The paragraphs below
+> record why it existed; the reasoning still applies to whatever replaces it.
 
 `Claims` carries only `sub` and `exp` — there is no role in the token — so admin
-cannot be established from the token alone. The shared key is the interim gate.
-Notes on it:
+cannot be established from the token alone, and with the interim key gone
+nothing establishes it at all. Notes on the key as it was:
 
-- **Fails closed:** with `WOW_ADMIN_KEY` unset the endpoint returns **503**. An
-  unset variable never means "allow everyone".
-- **Constant-time compare**, so a wrong key can't be recovered by timing.
-- It identifies *"someone holding the key"*, not a person. Each write logs the
-  token's `sub` so a geofence change still traces back to a login.
+- **Failed closed:** with `WOW_ADMIN_KEY` unset the endpoint returned **503**. An
+  unset variable never meant "allow everyone".
+- **Constant-time compare**, so a wrong key couldn't be recovered by timing.
+- It identified *"someone holding the key"*, not a person. Each write still logs
+  the token's `sub`, so a geofence change traces back to a login.
 - **Replace with a role claim** once the token carries one. `auth.rs` already reads
   `user_role` from DU's login response but does not put it in the JWT. Adding a
   required field to `Claims` breaks every token issued before the change, and
@@ -235,7 +239,6 @@ existing mapping rather than duplicating it.
 ```bash
 curl -X POST https://<host>/ext-api/wow-attendance/mapping-save \
   -H "Authorization: Bearer <token>" \
-  -H "X-Admin-Key: $WOW_ADMIN_KEY" \
   -H "Content-Type: application/json" \
   -d '{"body_code":"490010","building_name":"Estate Office",
        "lat":23.72815,"long":90.39925,"radius":50,"is_active":true}'
@@ -243,8 +246,7 @@ curl -X POST https://<host>/ext-api/wow-attendance/mapping-save \
 
 ### Response
 
-`200` on success, `400` on a validation rejection, `403` on a bad admin key, `503`
-when `WOW_ADMIN_KEY` is unset.
+`200` on success, `400` on a validation rejection, `401` on a bad token.
 
 ```json
 {
@@ -450,8 +452,7 @@ working, but it means seeding must land *with* the deploy, not after it.
    ```
    Both are additive and idempotent. If the mismatch table is missing, ownership
    rejections still work — the audit insert just logs a warning and is skipped.
-2. Set `WOW_ADMIN_KEY` in the server `.env` — until then `/mapping-save` returns 503.
-3. Set the three directory paths in the server `.env` to **absolute, in-container**
+2. Set the three directory paths in the server `.env` to **absolute, in-container**
    values (§5), create them, and make them writable by the container's process
    user. Env changes need a container **recreate**, not just `restart`.
    ```
@@ -459,17 +460,17 @@ working, but it means seeding must land *with* the deploy, not after it.
    WOW_UPLOADS_SERVE_DIR=<container-path>/uploads
    WOW_LOG_DIR=<container-path>/uploads/log
    ```
-4. Seed a mapping for every office code with staff checking in. Ranked by
+3. Seed a mapping for every office code with staff checking in. Ranked by
    headcount so the ones that matter come first:
    ```
    psql "$DATABASE_URL" -c "select office, count(*) from ictcell.employees
                             group by office order by 2 desc;"
    ```
    Office codes resolve to names via `ictcell.body` (`body_code` → `name`).
-5. Confirm the mobile app sends `device_lat` / `device_long` inside `device_info`.
+4. Confirm the mobile app sends `device_lat` / `device_long` inside `device_info`.
    **Employee check-ins 400 without them.**
-6. Deploy the API.
-7. Confirm logs write **and** are not web-readable: after one request, the file
+5. Deploy the API.
+6. Confirm logs write **and** are not web-readable: after one request, the file
    appears under `<uploads>/log` on the host, but `GET /uploads/log/` returns 404.
 
 ---

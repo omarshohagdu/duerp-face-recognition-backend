@@ -609,8 +609,8 @@ parse.
 ```
 POST /ext-api/wow-attendance/mapping-save
 Content-Type: application/json
-Authorization: Bearer <token>          ← a normal user token, still required
-X-Admin-Key:   <shared admin key>      ← additionally required
+Authorization: Bearer <token>          ← a normal user token, and the only
+                                         authorization this endpoint has
 X-App-Id / X-App-Password
 ```
 
@@ -708,8 +708,7 @@ it immediately rather than making the admin retype everything.
 
 | HTTP | `message` | UI treatment |
 |---|---|---|
-| **503** | `Admin operations are not configured on this server` | `WOW_ADMIN_KEY` is unset — the endpoint fails **closed**. Not retryable, not the admin's fault: "Geo-fence editing isn't enabled on this server." Route to IT |
-| **403** | `Valid \`X-Admin-Key\` header required for this operation` | Wrong or missing admin key. Distinct from a normal `403` — do not send the user to re-login, the bearer token is fine |
+| 403 | `IP address not allowed for this endpoint` | Device/network setup; route to IT. This is the only 403 the endpoint still returns |
 | 401 | token errors | Ordinary session expiry; refresh then retry |
 | 400 | `` `body_code` is required `` | Client-side validation should prevent this |
 | 400 | `Either \`building_id\` or \`building_name\` is required` | Enforce in the form: one of the two must be filled |
@@ -724,17 +723,20 @@ credentials problem.
 
 ### 7.7 Access model, and what it does not give you
 
-Two credentials are required together: a normal **bearer token** *and* the shared
-**`X-Admin-Key`**.
+**One credential: a normal bearer token.** The shared `X-Admin-Key` this section
+used to describe has been removed from the service, so `mapping-save` — like
+`reports/*` and `logs/*` — accepts any account that can sign in.
 
-The key is shared, so it identifies *an* admin, not *which* admin — it cannot
-drive per-user permissions, and the UI should not imply it can. The server does
-record the token's user id alongside the write for attribution, visible in the
-step log; if you need "who changed this fence", that log is where it lives.
+The service therefore has **no concept of an admin**. The token carries only
+`sub` and `exp`, so a role cannot be checked; hiding the screen by
+`user_data.user_role` is navigation, and a hand-made request ignores it. The
+server does record the token's user id alongside the write for attribution,
+visible in the step log; if you need "who changed this fence", that log is where
+it lives — but it names who did it, not who was allowed to.
 
-Because the key is shared and long-lived, **do not ship it in a client bundle**
-where end users can extract it. This screen belongs in an internal admin tool
-whose backend holds the key, not in the attendance app itself.
+Anyone deploying this needs to know that the geo-fence for every office is
+writable by the whole signed-in population, and that the ext-api IP allow-list is
+the only boundary left in front of it.
 
 ---
 
@@ -753,7 +755,7 @@ four separate ways — **do not import it on these screens.**
 | 1 | `baseURL: VITE_API_END_POINT` → **`:8080`** | Attendance is a **different service on `:8083`**. Every call would hit duerp-api and 404 |
 | 2 | `headers: { "Content-Type": "application/json" }` | Enroll and verify are **multipart**. A hardcoded JSON content-type means **no `boundary`**, and the body never parses |
 | 3 | 401 response interceptor calls `logoutFn()` | Attendance returns **401 for `token mismatch`** — "not your face". That is *not* session expiry. Reusing this client **logs the user out** when a face fails to match |
-| 4 | attaches `Authorization` only | `X-App-Id` / `X-App-Password` are required on **every** attendance call, and `X-Admin-Key` on mapping-save |
+| 4 | attaches `Authorization` only | `X-App-Id` / `X-App-Password` are required on **every** attendance call |
 
 Hazard 3 is the nastiest: it turns a recoverable "try again" into a forced
 re-login, and it will look like a random logout bug in the field.
@@ -813,10 +815,12 @@ by anyone who opens devtools. So:
 - `VITE_EXT_APP_ID` / `VITE_EXT_APP_PASSWORD` are *already* effectively public in
   any browser client — accept that, and rely on the IP allow-list as the real
   boundary.
-- **`X-Admin-Key` must never be a `VITE_` var.** It is a shared admin secret
-  ([§7.7](#77-access-model-and-what-it-does-not-give-you)). The mapping-save
-  screen must call a **duerp-api-side proxy route** that holds the key
-  server-side. A React screen cannot hold it safely.
+- **No admin credential exists to hold.** `X-Admin-Key` is gone
+  ([§7.7](#77-access-model-and-what-it-does-not-give-you)), which removes the
+  "a React screen cannot hold this secret" problem by removing the secret — and
+  with it the authorization. If admin-only writes are wanted back, the answer is
+  still a **duerp-api-side proxy route** holding a real credential, not a value
+  in the bundle.
 
 ### 8.3 Camera capture
 
@@ -979,8 +983,7 @@ support. **Do not show them verbatim.** Map them:
 | `Face enrollment failed on the AI platform; nothing was saved` | We couldn't set up your face right now. Nothing was saved — please try again. |
 | `Invalid App ID or Password` / `IP address not allowed…` | Something's wrong with this device's setup. Contact IT. |
 | `Employee has no office assigned` | Your office isn't set up for attendance yet. Contact HR. |
-| `Admin operations are not configured on this server` | Geo-fence editing isn't enabled on this server. Contact IT. |
-| `Valid \`X-Admin-Key\` header required for this operation` | You don't have permission to change geo-fences. |
+
 | `No employee has office=… — this mapping will never verify anyone` | Saved, but no staff are assigned to office {code} — check the office code. |
 | `radius …m is below 20m; GPS drift…` | Saved, but {radius} m is very tight. GPS is accurate to ~50 m, so valid check-ins may be rejected. |
 
@@ -1059,15 +1062,17 @@ log viewer.
     cannot run on the current plain-HTTP LAN origin
     ([§8.2](#82-two-hard-browser-constraints)). Someone needs to own TLS for
     dev/staging before §3 and §4 can be built at all.
-13. **`mapping-save` needs a server-side proxy.** A React client cannot hold
-    `X-Admin-Key` safely, so the geo-fence screen depends on a duerp-api route
-    that holds the key and forwards the call
-    ([§8.2](#82-two-hard-browser-constraints)). That route does not exist yet.
+13. **`mapping-save` has no authorization at all.** The `X-Admin-Key` it used to
+    require has been removed, so any signed-in account can rewrite any office's
+    geo-fence ([§7.7](#77-access-model-and-what-it-does-not-give-you)). The fix
+    is a duerp-api route holding a real credential, or a role claim in the token;
+    neither exists yet.
 14. **`attendance.enrollment.view` does not exist** as a resource key; the
     enrolled-list screen needs a seed row in `duerp-db/access_control.sql`
     ([§8.5](#85-routing-and-permission-gating)).
-15. **`X-Admin-Key` is a shared secret**, so geo-fence edits cannot be attributed
-    to a person through the API, and the key must never ship in a client bundle
-    ([§7.7](#77-access-model-and-what-it-does-not-give-you)). If per-admin
-    permissions are wanted, this needs to move onto the same role system the rest
-    of the ERP uses.
+15. **The reports and step logs are open to every signed-in account.**
+    `reports/by-date`, `reports/by-person` (for any id, not just your own) and
+    both `logs/*` readers lost their `X-Admin-Key` along with `mapping-save`
+    ([§7.7](#77-access-model-and-what-it-does-not-give-you)). Attendance
+    movements, usernames, client IPs and GPS coordinates are readable by anyone
+    who can log in. This needs the same role system the rest of the ERP uses.

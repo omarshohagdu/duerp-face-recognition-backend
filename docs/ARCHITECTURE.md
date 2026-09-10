@@ -149,9 +149,10 @@ Two things to know about the gates:
   are written to `wow_attendance_token_mismatch_record` — that table is the
   impersonation-attempt audit trail, and it is the first place to look when
   investigating a disputed check-in.
-- **`mapping-save` fails closed too.** With `WOW_ADMIN_KEY` unset the endpoint
-  returns 503, never "open to everyone", and the key is compared in constant
-  time.
+- **`mapping-save` has no admin gate.** The `WOW_ADMIN_KEY` it once required
+  has been removed, so a valid bearer token is enough to move any office's
+  geo-fence. The write is still attributed: the token's `sub` goes into the step
+  log for every call.
 - **Step logs are never HTTP-reachable.** They carry tokens, client IPs and
   employee ids. `main.rs` registers a 404 block on `/uploads/log` *before* the
   static file service to shadow them. This ordering is load-bearing and is

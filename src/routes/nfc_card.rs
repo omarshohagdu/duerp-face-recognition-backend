@@ -17,10 +17,10 @@
 //!
 //! AUTH is the bearer token, on top of the `X-App-Id` / `X-App-Password` +
 //! IP allow-list gate `ExtAuthMiddleware` already applies to everything under
-//! `/ext-api`. No `X-Admin-Key`: card desks are not admins. Note what that
-//! means for `force_reassign` — any holder of a valid token, calling from an
-//! allow-listed IP, can move a card off another student. The allow-list is
-//! what keeps that to trusted readers, so keep those rows tight.
+//! `/ext-api`. Note what that means for `force_reassign` — any holder of a
+//! valid token, calling from an allow-listed IP, can move a card off another
+//! student. The allow-list is what keeps that to trusted readers, so keep
+//! those rows tight.
 //!
 //! THE RESPONSE ENVELOPE
 //! Both endpoints answer with `status` ("success" | "error") plus a `message`,

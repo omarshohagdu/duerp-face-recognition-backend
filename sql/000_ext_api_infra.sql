@@ -79,13 +79,13 @@ SELECT v.endpoint, '{127.0.0.1,::1}'::text[]
     ('/ext-api/wow-attendance/reports/by-person'),
     ('/ext-api/wow-attendance/ssl_image_verfiy'),
     ('/ext-api/wow-attendance/mapping-save'),
-    -- Admin-only log readers. They are gated by X-Admin-Key on top of this
-    -- list, but the middleware runs FIRST: without a row here every call to
-    -- them is a 403 before the key is ever looked at.
+    -- Step-log readers. They take a bearer token on top of this list, but the
+    -- middleware runs FIRST: without a row here every call to them is a 403
+    -- before the token is ever looked at.
     ('/ext-api/wow-attendance/logs/login'),
     ('/ext-api/wow-attendance/logs/attendance'),
     -- NFC card <-> student mapping. Gated by the app credentials + this list
-    -- plus a bearer token; no admin key. See docs/nfc_card.md.
+    -- plus a bearer token. See docs/nfc_card.md.
     ('/ext-api/nfc-card/get_card_info'),
     ('/ext-api/nfc-card/save_card_info')
   ) AS v(endpoint)

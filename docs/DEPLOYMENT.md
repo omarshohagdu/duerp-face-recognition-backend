@@ -101,9 +101,9 @@ can check in cannot necessarily open the reports — each path needs its own row
 
 The NFC card reader is a separate client on separate paths, so it needs its own
 two rows — `/ext-api/nfc-card/get_card_info` and
-`/ext-api/nfc-card/save_card_info`. Keep these tight: `save_card_info` takes no
-admin key, so any token holder calling from an allow-listed IP can reassign a
-card. See [`nfc_card.md`](nfc_card.md#auth).
+`/ext-api/nfc-card/save_card_info`. Keep these tight: any token holder calling
+from an allow-listed IP can reassign a card. See
+[`nfc_card.md`](nfc_card.md#auth).
 
 Behind a reverse proxy the recorded IP is whatever `X-Forwarded-For` resolves
 to, so the proxy **must** set it — otherwise every request appears to come from
@@ -131,43 +131,28 @@ interchangeable:
 
 The first two moved out of duerp-api on 2026-08-19; `WOW_LOG_DIR` did not.
 
-### Admin-gated endpoints and `WOW_ADMIN_KEY`
+### Endpoints that used to be admin-gated
 
-These require a shared `X-Admin-Key` matching `WOW_ADMIN_KEY`, on top of the
-bearer token and the ext-api gate:
+These five required a shared `X-Admin-Key` matching `WOW_ADMIN_KEY`. **That key
+has been removed** — from the service, from `.env.example`, and from the SPA —
+and they are now guarded by a valid bearer token and the ext-api gate alone:
 
-| Endpoint | When the key is needed |
+| Endpoint | Who can call it now |
 |---|---|
-| `mapping-save` | always — it writes |
-| `reports/by-date` | always — no per-person scope exists |
-| `reports/by-person` | only when `person_id` is not the token's own `sub` |
-| `logs/login`, `logs/attendance` | always |
+| `mapping-save` | any signed-in account — it writes the geo-fence |
+| `reports/by-date` | any signed-in account — every check-in, university-wide |
+| `reports/by-person` | any signed-in account, for **any** `person_id`, not just its own |
+| `logs/login`, `logs/attendance` | any signed-in account |
 
-**This is a breaking change for existing API clients.** Anything that read
-`by-date`, or read `by-person` for somebody other than its own token holder,
-now gets a `403` until it sends the key. Before deploying, check
-`ictcell.ext_api_call_logs` for who has been calling them:
+**Nothing on this box restricts them to admins any more.** The token carries only
+`sub` and `exp`, so the service cannot see a role; the SPA hides these screens
+from non-admin accounts, but that is navigation, not authorization, and a
+hand-made request bypasses it. Until a real role check exists, the ext-api IP
+allow-list (`ictcell.ext_api_allowed_ips`) is the only remaining boundary —
+which makes those rows, and who holds a login, the whole security story.
 
-```sql
-SELECT client_ip, endpoint, count(*), max(created_at)
-  FROM ictcell.ext_api_call_logs
- WHERE endpoint LIKE '/ext-api/wow-attendance/reports/%'
-   AND created_at > now() - interval '30 days'
- GROUP BY 1, 2 ORDER BY 3 DESC;
-```
-
-**Unset is fail-closed, not open** — with no `WOW_ADMIN_KEY` these answer
-`503 Admin operations are not configured on this server`, which is what a
-"nothing saves and nothing loads" report from an admin usually means. Check it
-first:
-
-```bash
-systemctl show duerp-attendance -p Environment | tr ' ' '\n' | grep WOW_ADMIN_KEY
-```
-
-The SPA never stores this key: it asks the operator to paste it, holds it in
-memory for the tab, and drops it on sign-out. It is deliberately NOT a `VITE_`
-var — those are inlined into the bundle where any end user can read them.
+Drop `WOW_ADMIN_KEY` from any deployed `.env`; nothing reads it. Clients that
+were sending `X-Admin-Key` keep working — an unrecognised header is ignored.
 
 ### The step-log viewers
 
@@ -189,8 +174,9 @@ opened, so a path outside the folder cannot be reached by naming it.
 
 Do not "simplify" this by dropping the `/uploads/log` blocks and letting the
 static route serve the folder. The files carry usernames, client IPs, GPS,
-employee ids and full request and response bodies; the whole point is that
-reaching one requires the admin key.
+employee ids and full request and response bodies. Reaching one now requires
+only a valid login (the admin key that used to gate the JSON readers is gone),
+so the 404 blocks are what keep them off an unauthenticated URL entirely.
 
 ## systemd
 

@@ -25,7 +25,7 @@ target
 uploads/
 
 # Real configuration and secrets. `.env` holds DATABASE_URL, JWT_SECRET (shared
-# with duerp-api), the ext-api app password and WOW_ADMIN_KEY — none of which
+# with duerp-api) and the ext-api app password — none of which
 # belong in the repository. `.env.example` is the committed template; copy it to
 # `.env` on each host and fill it in there (docs/DEPLOYMENT.md).
 .env

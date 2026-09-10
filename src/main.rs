@@ -107,18 +107,18 @@ async fn main() -> std::io::Result<()> {
                     .service(routes::wow_attendance::wow_records_by_person) // POST /ext-api/wow-attendance/reports/by-person?person_id=&from_date=&to_date=
                     .service(routes::wow_attendance::wow_ssl_image_verify)  // POST /ext-api/wow-attendance/ssl_image_verfiy (images: multiple file)
                     .service(routes::wow_attendance::wow_verify)         // POST /ext-api/wow-attendance/verify?id=&id_type=
-                    .service(routes::wow_attendance::wow_mapping_save)   // POST /ext-api/wow-attendance/mapping-save (admin; json: body_code, building_id|building_name, lat, long, radius)
-                    // Admin-only readers for the two step-log folders. They sit
-                    // here rather than on their own scope so they inherit the
+                    .service(routes::wow_attendance::wow_mapping_save)   // POST /ext-api/wow-attendance/mapping-save (json: body_code, building_id|building_name, lat, long, radius)
+                    // Readers for the two step-log folders. They sit here
+                    // rather than on their own scope so they inherit the
                     // app-credential + IP allow-list gate every other ext-api
-                    // call gets; each additionally requires `X-Admin-Key`.
+                    // call gets; on top of that each takes a bearer token.
                     // The `/uploads/log` and `/uploads/login` 404 blocks above
                     // stay — these serve JSON, never the files.
                     .service(routes::logs::wow_login_logs)      // POST /ext-api/wow-attendance/logs/login?file=&person_id=&from_date=&to_date=&page=&limit=
                     .service(routes::logs::wow_attendance_logs) // POST /ext-api/wow-attendance/logs/attendance?file=&person_id=&from_date=&to_date=&page=&limit=
                     // NFC card <-> student mapping. Same gate as everything
                     // else in this scope (app credentials + IP allow-list) plus
-                    // a bearer token; no admin key — see src/routes/nfc_card.rs.
+                    // a bearer token — see src/routes/nfc_card.rs.
                     // Both paths need their own `ext_api_allowed_ips` row, added
                     // by sql/004_nfc_card.sql, or every call is a 403.
                     .service(routes::nfc_card::nfc_get_card_info)  // GET|POST /ext-api/nfc-card/get_card_info?card_number= (or in the body)

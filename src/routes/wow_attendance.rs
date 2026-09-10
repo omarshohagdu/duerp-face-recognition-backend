@@ -207,21 +207,6 @@ fn user_from_token(token: &str) -> Result<TokenUser, HttpResponse> {
     }
 }
 
-// Is `requested` the same person as the token's `sub`?
-//
-// Compared numerically when both sides parse, because the two are not written
-// the same way: the token carries `sub` as a number (leading zeros gone) while
-// a caller sends the id as text. A staff id of "0202011007" would fail a naive
-// string compare against a `sub` of 202011007 and lock that person out of
-// their own records.
-fn same_person(requested: &str, token_sub: i64) -> bool {
-    let requested = requested.trim();
-    match requested.parse::<i64>() {
-        Ok(n) => n == token_sub,
-        Err(_) => requested == token_sub.to_string(),
-    }
-}
-
 // One step-log line naming which token the caller arrived on. A legacy line is
 // the signal that this caller has not migrated to `POST /login` yet — grep the
 // logs for it to find who is left before turning `WOW_ACCEPT_DU_TOKEN` off.
@@ -1825,15 +1810,15 @@ pub async fn wow_records_by_date(
     query: web::Query<RecordsByDateQuery>,
     mut payload: Multipart,
 ) -> HttpResponse {
-    if let Err(resp) = require_bearer_token(&req) {
-        return resp;
-    }
     // This report has no per-person scope — it returns every check-in the
-    // university made in the range — so there is no "your own" version of it to
-    // fall back to the way `by-person` does. A valid token alone used to be
-    // enough, which meant anyone who could sign in could read everyone's
-    // movements. It is an admin report; it takes the admin key.
-    if let Err(resp) = require_admin_key(&req) {
+    // university made in the range — and the shared admin key that used to sit
+    // on top of the token has been removed, so a valid login is the whole gate.
+    //
+    // `require_token_caller`, not `require_bearer_token`: the latter only pulls
+    // the header apart. With the key gone it is the signature and expiry check
+    // that stands between a made-up `Authorization` header and every check-in
+    // the university has recorded.
+    if let Err(resp) = require_token_caller(&req) {
         return resp;
     }
 
@@ -2005,26 +1990,18 @@ pub async fn wow_records_by_person(
         }
     };
 
-    // Whose records these are. Reading somebody else's attendance is an admin
-    // act, so it takes the admin key; reading your own takes only your token.
+    // Validate the token itself — `require_bearer_token` above only pulled the
+    // header apart, it checked neither signature nor expiry.
     //
-    // Without this the endpoint answered for ANY `person_id` a valid token
-    // asked for, which is how the self-service "My attendance" screen would
-    // have become a way to read a colleague's movements by editing one field.
-    let caller = match user_from_token(&token) {
-        Ok(u) => u,
-        Err(resp) => return resp,
-    };
-    if !same_person(&person_id, caller.person_id) {
-        // Returns 403 for a wrong key and 503 when WOW_ADMIN_KEY is unset, so
-        // "you may not" and "the server cannot tell" stay distinguishable.
-        if let Err(resp) = require_admin_key(&req) {
-            return resp;
-        }
+    // There is no ownership check left here. Reading somebody else's records
+    // used to require the shared admin key; with the key removed, this endpoint
+    // answers for ANY `person_id` a valid token asks for, which includes the
+    // self-service "My attendance" screen being edited to name a colleague.
+    if let Err(resp) = user_from_token(&token) {
+        return resp;
     }
-    // Bind what was checked. `same_person` compares the trimmed id, so binding
-    // the raw one would let " 2020111007 " pass the ownership check and then
-    // match no rows — an empty report that looks like "you have no attendance".
+    // Trim before binding: " 2020111007 " would otherwise match no rows — an
+    // empty report that reads as "you have no attendance".
     let person_id = person_id.trim().to_string();
 
     let result = sqlx::query_scalar::<_, Value>(
@@ -2798,73 +2775,12 @@ async fn wow_verify_inner(
 //
 // Sets the GPS position and radius that the location gate in `wow_verify`
 // checks against, so this endpoint defines the geofence for every employee
-// in an office.
+// in an office. It takes a valid bearer token and nothing more — the
+// `X-Admin-Key` that used to gate it has been removed.
 // ---------------------------------------------------------------------
 
-// Admin gate for the mapping writes.
-//
-// `Claims` carries only `sub` and `exp` — there is no role in the token — so
-// admin cannot be established from the bearer token alone. Until roles exist,
-// writes require a shared `X-Admin-Key` matching `WOW_ADMIN_KEY`, on top of
-// the bearer token and ExtAuthMiddleware that already guard `/ext-api`.
-//
-// The key is shared, so it identifies "someone holding the key", not a person;
-// callers are logged with the token's `sub` so a write can still be traced back
-// to a login. Replace this with a role claim once the token carries one.
-pub(crate) fn require_admin_key(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
-    let configured = match std::env::var("WOW_ADMIN_KEY") {
-        Ok(v) if !v.trim().is_empty() => v,
-        // Fail closed: with no key configured the endpoint is unusable rather
-        // than open. An unset env var must never mean "allow everyone".
-        _ => {
-            eprintln!("WOW_ADMIN_KEY not configured; refusing mapping write");
-            return Err(HttpResponse::ServiceUnavailable().json(json!({
-                "success": false,
-                "message": "Admin operations are not configured on this server"
-            })));
-        }
-    };
-
-    let supplied = req
-        .headers()
-        .get("X-Admin-Key")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .unwrap_or_default();
-
-    // Constant-time compare so a wrong key can't be recovered byte-by-byte by
-    // timing the response.
-    let a = supplied.as_bytes();
-    let b = configured.trim().as_bytes();
-    let equal = a.len() == b.len()
-        && a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0;
-
-    if !equal {
-        return Err(HttpResponse::Forbidden().json(json!({
-            "success": false,
-            "message": "Valid `X-Admin-Key` header required for this operation"
-        })));
-    }
-    Ok(())
-}
-
-// Bearer token + admin key in one call, for endpoints where BOTH are required
-// and neither identifies a person on its own.
-//
-// Order matters: the token is validated first so an expired session reports as
-// a 401 the SPA can act on (re-login), rather than as a 403 that looks like a
-// wrong admin key. Returns the token's `sub` so the caller can be named in a
-// log line — the key itself is shared and identifies nobody.
-pub(crate) fn require_admin_caller(
-    req: &actix_web::HttpRequest,
-) -> Result<i64, HttpResponse> {
-    let token = require_bearer_token(req)?;
-    let user = user_from_token(&token)?;
-    require_admin_key(req)?;
-    Ok(user.person_id)
-}
-
-// Bearer token only, for endpoints that need a valid login but no admin role.
+// Bearer token: valid login required, and — since the admin key was removed
+// — the only authorization any endpoint in this module has.
 //
 // Returns the token's `sub` together with the one-line description of WHICH
 // token source it arrived on. Callers log that line: it is how a caller still
@@ -2943,14 +2859,10 @@ async fn wow_mapping_save_inner(
     };
     log.step(token_step(&token_user));
 
-    if let Err(resp) = require_admin_key(&req) {
-        log.step("admin key check FAILED — rejecting request");
-        return resp;
-    }
-    // Attribution for a geofence change: the shared key says only that the
-    // caller is an admin, so record which login performed the write.
+    // Attribution for a geofence change. With the admin key gone the token is
+    // the only thing naming who moved a building, so keep logging its `sub`.
     log.step(format!(
-        "admin key OK — mapping write by token user id={}",
+        "mapping write by token user id={}",
         token_user.person_id
     ));
 

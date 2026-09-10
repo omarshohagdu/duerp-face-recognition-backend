@@ -75,11 +75,11 @@ Both endpoints sit under `/ext-api`, so `ExtAuthMiddleware` applies first:
 | 2 · IP allow-list | A row in `ictcell.ext_api_allowed_ips` for the **exact path**, containing the caller's IP | `403 IP address not allowed for this endpoint` |
 | 3 · Bearer token | `Authorization: Bearer <token>` from `POST /login` (signature + expiry verified) | `401` |
 
-**No `X-Admin-Key`.** Card desks are not admins, so neither endpoint requires
-one. Be aware of what that means for `force_reassign`: **any** holder of a valid
-token, calling from an allow-listed IP, can take a card off another student. The
-IP allow-list is the only thing scoping that to trusted readers — keep those
-rows tight, and see [Reassigning a card](#reassigning-a-card).
+**The bearer token is the whole authorization.** Be aware of what that means
+for `force_reassign`: **any** holder of a valid token, calling from an
+allow-listed IP, can take a card off another student. The IP allow-list is the
+only thing scoping that to trusted readers — keep those rows tight, and see
+[Reassigning a card](#reassigning-a-card).
 
 > **Both endpoints need their own allow-list row** or every call is a `403`
 > before the handler runs. `sql/004_nfc_card.sql` seeds them with
@@ -547,7 +547,7 @@ Read them on the box, or through the gated
 | — (not in the spec) | `is_verified_label` / `registration_type_label` | Requested: the response carries each enum's meaning alongside the number, so a screen need not hard-code the mapping. |
 | Image URLs like `.../cards/APP-2026-00123.jpg` | UUID-prefixed filenames | A deterministic name would clobber the previous image on re-save and lose the audit trail. |
 | Card reassignment "silently / `force_reassign` / blocked" (open question) | `409` by default, `force_reassign=true` to override | Blocking outright would need a DBA for every re-issue; silent overwrite lets a typo'd scan quietly unassign a card. |
-| `save_card_info` auth "admin/staff role" | Bearer token, no `X-Admin-Key` | Chosen so card desks are not admins. See the warning under [Auth](#auth). |
+| `save_card_info` auth "admin/staff role" | Bearer token only | This service has no role to check — the token carries only `sub` and `exp`. See the warning under [Auth](#auth). |
 | Attendance check-in on scan (open question) | Not implemented | `get_card_info` is a pure lookup; check-in stays a separate downstream call. |
 | Image storage backend (open question) | Local disk under the served `uploads` tree | Matches how the face module already stores images; no S3/GCS credentials exist in this service. |
 
