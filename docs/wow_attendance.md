@@ -207,8 +207,25 @@ must pass **two** checks:
 | `WOW_UPLOAD_DIR`   | no       | Base upload dir (default `./uploads/wow_attendance`)          |
 | `WOW_MAX_IMAGE_MB` | no       | Max size per uploaded image, in MB (default `5`; fractional allowed) |
 | `SSL_API_ENDPOINT` | yes\*\*  | DU backend base URL; enroll/verify call `{SSL_API_ENDPOINT}getByEmployeeId` to authorize the person and resolve `id_type` |
+| `LOGIN_API_ENDPOINT` | no     | Login upstream base URL for `POST /login`, when it differs from `SSL_API_ENDPOINT` — e.g. DU's ITS gateway `https://api.its.du.ac.bd/`. Blank falls back to `SSL_API_ENDPOINT` (see below) |
 | `WOW_IDTYPE_FALLBACK` | no    | `id_type` used when DU does not confirm an employee (see below) |
 | `WOW_ACCEPT_DU_TOKEN` | no    | Also accept DU's legacy `access_token` (default `true`). Set to `false` once all clients send the `POST /login` token |
+
+\* `LOGIN_API_ENDPOINT` exists because DU's two backends do not share a login
+contract, and only one of them serves `getByEmployeeId`:
+
+| | `LOGIN_API_ENDPOINT` (ITS gateway) | `SSL_API_ENDPOINT` (DU Laravel) |
+|---|---|---|
+| login request | JSON `{username, password}` | form field `email` + `secret-key` header |
+| login response | `{token, username, user_data}` | `{access_token, ..., user}` |
+| `getByEmployeeId` | **404 — not served** | yes |
+
+`src/routes/auth.rs` chooses the dialect from **which variable supplied the
+base**, never by sniffing the host, and `LOGIN_API_ENDPOINT` wins when both are
+set. Crossing the two fails as a bare `401` at the SPA — the gateway answers a
+form body with `400 Content type error`, Laravel answers a JSON body keyed
+`username` with `401` — so the per-login step log under `LOGIN_LOG_DIR` records
+the endpoint and the dialect on every attempt.
 
 \*\* Required for **enroll** and **verify**. Both call DU's `getByEmployeeId`
 (header `secret-key`, form `employee_id=<the person being enrolled/verified>`)

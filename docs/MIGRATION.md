@@ -193,7 +193,8 @@ Order matters: **start the new service before you stop serving the old paths.**
 
 2. **Configure `.env`.** Copy `duerp-api`'s values for the shared keys —
    `DATABASE_URL`, `JWT_SECRET`, `EXT_APP_ID`, `EXT_APP_PASSWORD`,
-   `SSL_API_ENDPOINT`, and every `WOW_*`. `JWT_SECRET` must be **byte-identical**
+   `SSL_API_ENDPOINT`, `LOGIN_API_ENDPOINT` (if that host uses DU's ITS gateway
+   for login), and every `WOW_*`. `JWT_SECRET` must be **byte-identical**
    or clients get intermittent 401s depending on which service minted their
    token.
 
