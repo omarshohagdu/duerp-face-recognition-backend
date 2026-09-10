@@ -120,7 +120,9 @@ async fn main() -> std::io::Result<()> {
                     // else in this scope (app credentials + IP allow-list) plus
                     // a bearer token — see src/routes/nfc_card.rs.
                     // Both paths need their own `ext_api_allowed_ips` row, added
-                    // by sql/004_nfc_card.sql, or every call is a 403.
+                    // by sql/004_nfc_card.sql, or every call is a 403. Those two
+                    // rows hold the `'*'` wildcard: reachable from any IP, with
+                    // the app credentials and bearer token as the only gate.
                     .service(routes::nfc_card::nfc_get_card_info)  // GET|POST /ext-api/nfc-card/get_card_info?card_number= (or in the body)
                     .service(routes::nfc_card::nfc_save_card_info) // POST /ext-api/nfc-card/save_card_info (multipart: student_applicant_id, card_number, is_verified, registration_type, force_reassign, card_image, student_selfie)
             )

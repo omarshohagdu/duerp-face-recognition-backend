@@ -462,24 +462,35 @@ END;
 $function$;
 
 -- ---------------------------------------------------------------------
--- 6 · Seed the ext-api IP allow-list
+-- 6 · Seed the ext-api IP allow-list — OPEN TO ALL IPs
 --
 -- ExtAuthMiddleware runs before every /ext-api handler and matches the FULL
 -- request path against `ictcell.ext_api_allowed_ips`. Without a row here every
 -- call to these two endpoints is a 403 before the handler is ever reached.
 --
--- Localhost only, matching sql/000_ext_api_infra.sql. Add the card reader's
--- real IP before going live:
+-- These two carry `'*'`, the wildcard the middleware reads as "any IP"
+-- (`ext_auth_middleware.rs`). The card readers are on campus DHCP with no
+-- stable addresses to list, so the allow-list cannot scope them and was asked
+-- to stop trying.
+--
+-- WHAT IS LEFT GUARDING THEM: the app credentials (`X-App-Id` /
+-- `X-App-Password`) and a valid bearer token — nothing else. `save_card_info`
+-- with `force_reassign=true` moves a card off another student, so any holder of
+-- those three, from anywhere that can reach the service, can do that. Whether
+-- that is acceptable depends entirely on the network the service is exposed on.
+--
+-- TO PUT THE ALLOW-LIST BACK, list the real IPs and drop the wildcard:
 --   UPDATE ictcell.ext_api_allowed_ips
---      SET ip_address = ip_address || '{203.0.113.10}'
---    WHERE endpoint = '/ext-api/nfc-card/get_card_info';
+--      SET ip_address = '{203.0.113.10,203.0.113.11}'::text[]
+--    WHERE endpoint IN ('/ext-api/nfc-card/get_card_info',
+--                       '/ext-api/nfc-card/save_card_info');
 --
 -- NOT `ON CONFLICT`: the production table has no unique constraint on
 -- `endpoint`, so an ON CONFLICT target would abort the script there.
 -- ---------------------------------------------------------------------
 
 INSERT INTO ictcell.ext_api_allowed_ips (endpoint, ip_address)
-SELECT v.endpoint, '{127.0.0.1,::1}'::text[]
+SELECT v.endpoint, '{*}'::text[]
   FROM (VALUES
     ('/ext-api/nfc-card/get_card_info'),
     ('/ext-api/nfc-card/save_card_info')
@@ -488,3 +499,14 @@ SELECT v.endpoint, '{127.0.0.1,::1}'::text[]
     SELECT 1 FROM ictcell.ext_api_allowed_ips a
      WHERE a.endpoint = v.endpoint
  );
+
+-- The INSERT above skips endpoints that already have a row, which on any
+-- database this has run against before is both of them. Open those too, and
+-- re-activate any that were switched off — idempotent, so re-running this file
+-- is safe.
+UPDATE ictcell.ext_api_allowed_ips
+   SET ip_address = ip_address || '{*}'::text[],
+       is_active  = true
+ WHERE endpoint IN ('/ext-api/nfc-card/get_card_info',
+                    '/ext-api/nfc-card/save_card_info')
+   AND NOT ('*' = ANY(ip_address));

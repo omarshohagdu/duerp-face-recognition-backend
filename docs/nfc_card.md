@@ -72,22 +72,32 @@ Both endpoints sit under `/ext-api`, so `ExtAuthMiddleware` applies first:
 | Layer | Requirement | Failure |
 |---|---|---|
 | 1 · App credentials | `X-App-Id` + `X-App-Password` matching `EXT_APP_ID` / `EXT_APP_PASSWORD` | `401 Invalid App ID or Password` |
-| 2 · IP allow-list | A row in `ictcell.ext_api_allowed_ips` for the **exact path**, containing the caller's IP | `403 IP address not allowed for this endpoint` |
+| 2 · IP allow-list | **Open to every IP.** Both rows carry the `'*'` wildcard, so the check passes for any caller; the row must still exist and be `is_active` | `403 IP address not allowed for this endpoint` |
 | 3 · Bearer token | `Authorization: Bearer <token>` from `POST /login` (signature + expiry verified) | `401` |
 
-**The bearer token is the whole authorization.** Be aware of what that means
-for `force_reassign`: **any** holder of a valid token, calling from an
-allow-listed IP, can take a card off another student. The IP allow-list is the
-only thing scoping that to trusted readers — keep those rows tight, and see
+**The app credentials and the bearer token are the whole authorization**, and
+the app credentials are shared by every ext-api client. Be aware of what that
+means for `force_reassign`: **any** holder of a valid token, calling from
+**anywhere that can reach the service**, can take a card off another student.
+The IP allow-list used to scope that to trusted readers; it no longer does. See
 [Reassigning a card](#reassigning-a-card).
 
-> **Both endpoints need their own allow-list row** or every call is a `403`
-> before the handler runs. `sql/004_nfc_card.sql` seeds them with
-> `127.0.0.1`/`::1` only:
+> **Both endpoints still need their own allow-list row** — the wildcard lives
+> *in* the row, so a missing or `is_active = false` row is still a `403` before
+> the handler runs. `sql/004_nfc_card.sql` seeds and opens both:
+>
+> ```sql
+> -- what the migration leaves in place
+> SELECT endpoint, ip_address, is_active
+>   FROM ictcell.ext_api_allowed_ips
+>  WHERE endpoint LIKE '/ext-api/nfc-card/%';   -- ip_address = {*}
+> ```
+>
+> To scope them back to real readers, replace the wildcard with their IPs:
 >
 > ```sql
 > UPDATE ictcell.ext_api_allowed_ips
->    SET ip_address = ip_address || '{203.0.113.10}'
+>    SET ip_address = '{203.0.113.10,203.0.113.11}'::text[]
 >  WHERE endpoint IN ('/ext-api/nfc-card/get_card_info',
 >                     '/ext-api/nfc-card/save_card_info');
 > ```
@@ -484,12 +494,13 @@ these headers, only the two `/ext-api/nfc-card/*` calls do.
 
 ### `403 IP address not allowed for this endpoint`
 
-The message names the IP it saw. The check matches the **full path**, so each
-endpoint needs its own row:
+Both NFC rows are open to every IP, so this should not be reachable on these
+two paths. If it is, the row is missing or `is_active = false` — the check
+matches the **full path**, and each endpoint needs its own row:
 
 ```sql
 UPDATE ictcell.ext_api_allowed_ips
-   SET ip_address = ip_address || '{203.0.113.10}'
+   SET ip_address = ip_address || '{*}'::text[], is_active = true
  WHERE endpoint IN ('/ext-api/nfc-card/get_card_info',
                     '/ext-api/nfc-card/save_card_info');
 ```

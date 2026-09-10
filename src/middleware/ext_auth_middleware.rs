@@ -90,15 +90,26 @@ where
                 return Ok(req.into_response(res));
             }
 
-            // IP check against database
+            // IP check against database.
+            //
+            // `'*'` in `ip_address` OPENS THE ENDPOINT TO EVERY IP. It is how an
+            // endpoint with no fixed set of callers — the NFC card readers, which
+            // are on DHCP across campus — is served without listing addresses
+            // that change. Kept in the row rather than as a list of paths here so
+            // it is an operator decision, revertible with one UPDATE and no
+            // redeploy, and visible in the same place the real IPs are.
+            //
+            // Nothing else changes: the row must still exist, still be
+            // `is_active`, and the app credentials and bearer token still apply.
+            // Set it ONLY on endpoints whose own auth is enough on its own.
             if let Some(pool) = db {
                 let allowed: bool = sqlx::query_scalar(
                     r#"
                     SELECT EXISTS (
                         SELECT 1 FROM ictcell.ext_api_allowed_ips
                         WHERE endpoint = $1
-                          AND $2 = ANY(ip_address)
                           AND is_active = true
+                          AND ('*' = ANY(ip_address) OR $2 = ANY(ip_address))
                     )
                     "#,
                 )

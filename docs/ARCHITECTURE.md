@@ -130,6 +130,11 @@ Two things to know about the gates:
 - **The IP allow-list is exact-path, not prefix.** A new endpoint is
   unreachable until a row for its full path exists in `ext_api_allowed_ips`.
   `sql/000_ext_api_infra.sql` seeds all eight current paths with localhost.
+- **`'*'` in a row's `ip_address` disables the IP check for that endpoint.**
+  Both `/ext-api/nfc-card/*` paths carry it (`sql/004_nfc_card.sql`) because the
+  card readers are on campus DHCP: they are reachable from any IP, guarded by
+  the app credentials and a bearer token alone. Nothing else uses the wildcard,
+  and removing it from the row restores the allow-list without a redeploy.
 - **`ApiLogger` buffers the request body** to log it, then reconstructs the
   payload for the handler. On multipart uploads the body is not JSON, so it is
   stored as a JSON string rather than parsed — the log row is still written.

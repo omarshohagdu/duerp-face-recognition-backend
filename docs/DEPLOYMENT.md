@@ -99,11 +99,17 @@ can check in cannot necessarily open the reports — each path needs its own row
 `enrolled`, `check`, `reports/by-date`, `reports/by-person`, `mapping-save`,
 `logs/login` and `logs/attendance`.
 
-The NFC card reader is a separate client on separate paths, so it needs its own
-two rows — `/ext-api/nfc-card/get_card_info` and
-`/ext-api/nfc-card/save_card_info`. Keep these tight: any token holder calling
-from an allow-listed IP can reassign a card. See
+The NFC card reader is a separate client on separate paths, and it has its own
+two rows — `/ext-api/nfc-card/get_card_info` and `/ext-api/nfc-card/save_card_info`
+— **both open to every IP**. They hold the `'*'` wildcard rather than a list of
+addresses, because the readers are on campus DHCP. That leaves the app
+credentials and a bearer token as the only gate on them, and any token holder
+who can reach the service can reassign a card. See
 [`nfc_card.md`](nfc_card.md#auth).
+
+`'*'` works on any row, not just these. Use it only where the endpoint's own
+auth is enough by itself; drop it from the array to put the allow-list back,
+with no redeploy.
 
 Behind a reverse proxy the recorded IP is whatever `X-Forwarded-For` resolves
 to, so the proxy **must** set it — otherwise every request appears to come from
@@ -148,8 +154,9 @@ and they are now guarded by a valid bearer token and the ext-api gate alone:
 `sub` and `exp`, so the service cannot see a role; the SPA hides these screens
 from non-admin accounts, but that is navigation, not authorization, and a
 hand-made request bypasses it. Until a real role check exists, the ext-api IP
-allow-list (`ictcell.ext_api_allowed_ips`) is the only remaining boundary —
-which makes those rows, and who holds a login, the whole security story.
+allow-list (`ictcell.ext_api_allowed_ips`) is the only remaining boundary on the
+`wow-attendance` paths — which makes those rows, and who holds a login, the whole
+security story. (The two `nfc-card` paths have opted out of it with `'*'`.)
 
 Drop `WOW_ADMIN_KEY` from any deployed `.env`; nothing reads it. Clients that
 were sending `X-Admin-Key` keep working — an unrecognised header is ignored.

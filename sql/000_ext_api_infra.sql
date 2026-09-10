@@ -10,6 +10,8 @@
 -- The column shapes are the ones the middleware queries require:
 --   * ext_api_allowed_ips.ip_address is an ARRAY — the check is
 --     `$2 = ANY(ip_address)`, one row per endpoint holding many IPs.
+--     A literal `'*'` in that array means "any IP" and skips the check for
+--     that endpoint; sql/004_nfc_card.sql uses it for the two NFC paths.
 --   * status_code is smallint — api_logger binds `status_code as i16`.
 --
 -- Apply first: this file, then 001 -> 002 -> 003.
@@ -59,7 +61,8 @@ CREATE INDEX IF NOT EXISTS ext_api_call_logs_endpoint_status_idx
     ON ictcell.ext_api_call_logs (endpoint, status_code);
 
 -- ── Seed the allow-list for this service's endpoints ─────────────────
--- Localhost only. Add real client IPs per endpoint before going live:
+-- Localhost only. Add real client IPs per endpoint before going live (or `'*'`
+-- for any IP, as sql/004_nfc_card.sql does for the two NFC paths):
 --   UPDATE ictcell.ext_api_allowed_ips
 --      SET ip_address = ip_address || '{203.0.113.10}'
 --    WHERE endpoint = '/ext-api/wow-attendance/verify';
