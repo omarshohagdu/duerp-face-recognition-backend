@@ -88,7 +88,7 @@ runtime — schema changes are always an explicit `psql` run.
 added per endpoint, because the check matches the **full path**, not a prefix:
 
 ```sql
-UPDATE ictcell.ext_api_allowed_ips
+UPDATE attendance.ext_api_allowed_ips
    SET ip_address = ip_address || '{203.0.113.10}'
  WHERE endpoint IN ('/ext-api/wow-attendance/verify',
                     '/ext-api/wow-attendance/enroll');
@@ -154,7 +154,7 @@ and they are now guarded by a valid bearer token and the ext-api gate alone:
 `sub` and `exp`, so the service cannot see a role; the SPA hides these screens
 from non-admin accounts, but that is navigation, not authorization, and a
 hand-made request bypasses it. Until a real role check exists, the ext-api IP
-allow-list (`ictcell.ext_api_allowed_ips`) is the only remaining boundary on the
+allow-list (`attendance.ext_api_allowed_ips`) is the only remaining boundary on the
 `wow-attendance` paths — which makes those rows, and who holds a login, the whole
 security story. (The two `nfc-card` paths have opted out of it with `'*'`.)
 

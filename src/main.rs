@@ -7,7 +7,9 @@
 //! and everything else stays with duerp-api.
 //!
 //! The database is shared: both services talk to the same Postgres `ictcell`
-//! schema, so nothing had to be migrated. See `docs/ARCHITECTURE.md`.
+//! schema, so nothing had to be migrated. The one exception is this service's
+//! own ext-api gate and NFC tables, which live in `attendance` — see
+//! `sql/005_ext_api_attendance_schema.sql` and `docs/ARCHITECTURE.md`.
 
 mod middleware;
 mod models;

@@ -25,7 +25,7 @@ collection variables below.
   **decodes it without verifying the signature** (it is signed with DU's own secret),
   so the `/ext-api` scope is protected only by X-App-Id/password + the IP allow-list.
 - **IP allow-list:** the caller IP must be present for that exact endpoint path in
-  `ictcell.ext_api_allowed_ips`, else `403`.
+  `attendance.ext_api_allowed_ips`, else `403`.
 - **`id` / `id_type`** may be query params or form fields — **except on `enroll`,
   where `id_type` is resolved from the token's user** (the backend decodes the token
   for `sub`, then calls the DU `getUserInfo` endpoint with that user id) and is not sent.

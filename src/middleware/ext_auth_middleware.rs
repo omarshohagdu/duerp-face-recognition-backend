@@ -106,7 +106,7 @@ where
                 let allowed: bool = sqlx::query_scalar(
                     r#"
                     SELECT EXISTS (
-                        SELECT 1 FROM ictcell.ext_api_allowed_ips
+                        SELECT 1 FROM attendance.ext_api_allowed_ips
                         WHERE endpoint = $1
                           AND is_active = true
                           AND ('*' = ANY(ip_address) OR $2 = ANY(ip_address))

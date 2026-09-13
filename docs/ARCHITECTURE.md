@@ -78,7 +78,7 @@ writes are listed below; it only *reads* the identity tables.
 | `buildings`, `body_building_mapping` | duerp-attendance | read + write (`mapping-save`) |
 | `nfc_student_cards` | duerp-attendance | read + write (`nfc-card/*`) |
 | `nfc_card_audit` | duerp-attendance | write (audit) |
-| `ext_api_allowed_ips`, `ext_api_call_logs` | shared | read / append |
+| `attendance.ext_api_allowed_ips`, `attendance.ext_api_call_logs` | duerp-attendance | read / append |
 | `employees`, `lms_student`, `lms_faculty`, `body` | duerp-api / DU sync | **read only** |
 
 Nothing in duerp-api writes the `wow_attendance_*` or `nfc_*` tables, so there
@@ -128,8 +128,12 @@ flowchart TD
 Two things to know about the gates:
 
 - **The IP allow-list is exact-path, not prefix.** A new endpoint is
-  unreachable until a row for its full path exists in `ext_api_allowed_ips`.
-  `sql/000_ext_api_infra.sql` seeds all eight current paths with localhost.
+  unreachable until a row for its full path exists in
+  `attendance.ext_api_allowed_ips`. `sql/000_ext_api_infra.sql` seeds all
+  twelve current paths with localhost; `sql/005_ext_api_attendance_schema.sql`
+  brings the real client IPs across from the `ictcell` table this service
+  used to read. **duerp-api still reads its own `ictcell` copy** — the two
+  no longer track each other, so an IP added there has no effect here.
 - **`'*'` in a row's `ip_address` disables the IP check for that endpoint.**
   Both `/ext-api/nfc-card/*` paths carry it (`sql/004_nfc_card.sql`) because the
   card readers are on campus DHCP: they are reachable from any IP, guarded by

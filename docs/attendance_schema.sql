@@ -25,10 +25,16 @@
 --       copied, so there is exactly one employee record in the database and it
 --       stays duerp-api's. body / lms_student / lms_faculty are still read
 --       fully qualified; give them the same treatment if you ever need it.
---   ictcell.ext_api_allowed_ips, ictcell.ext_api_call_logs
---       Shared ext-api infrastructure. duerp-api writes to both, so they are
---       not this service's to move. `sql/000_ext_api_infra.sql` still owns
---       them and must be applied separately.
+--
+-- WHAT MOVED OUT OF ictcell
+--   attendance.ext_api_allowed_ips, attendance.ext_api_call_logs
+--       This service's ext-api gate. It used to read the shared ictcell pair;
+--       sql/005_ext_api_attendance_schema.sql gave this service its own copies
+--       and copied the wow-attendance / nfc-card rows across. The ictcell pair
+--       still exists and duerp-api still uses it — nothing was dropped there,
+--       and the two no longer track each other. These tables are created by
+--       `sql/000_ext_api_infra.sql`, not by this file, and must be applied
+--       separately.
 --
 -- APPLY
 --   psql "$DATABASE_URL" -f docs/attendance_schema.sql
@@ -984,10 +990,11 @@ CREATE INDEX IF NOT EXISTS wow_attendance_token_mismatch_created_idx
 -- `GRANT ... ON ALL TABLES IN SCHEMA attendance`, which only reaches tables
 -- that already exist when it runs.
 --
--- NOT copied from the migration: its `ictcell.ext_api_allowed_ips` seed. That
--- table belongs to sql/000_ext_api_infra.sql, not to this schema — but the two
--- endpoints still need their rows there or every call is a 403 before the
--- handler runs. Apply sql/000 as well, or insert them by hand.
+-- NOT copied from the migration: its `attendance.ext_api_allowed_ips` seed. That
+-- table is created by sql/000_ext_api_infra.sql rather than by this file, even
+-- though it now lives in this schema — but the two endpoints still need their
+-- rows in it or every call is a 403 before the handler runs. Apply sql/000 as
+-- well, or insert them by hand.
 -- ---------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------
@@ -1101,7 +1108,7 @@ COMMENT ON TABLE attendance.nfc_student_cards IS
 -- 5d · Audit trail
 --
 -- Business-logic step 6 of the spec ("log who saved it, when, which fields
--- changed"). The step logs and `ictcell.ext_api_call_logs` already record the
+-- changed"). The step logs and `attendance.ext_api_call_logs` already record the
 -- calls, but neither answers the question this table exists for: who held this
 -- card before, and when did it move. Reassignment makes that history the
 -- point, so it gets a table rather than a grep.

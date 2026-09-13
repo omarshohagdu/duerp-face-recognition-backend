@@ -183,7 +183,7 @@ must pass **two** checks:
 | Check        | How                                                                                 | Failure |
 |--------------|-------------------------------------------------------------------------------------|---------|
 | Credentials  | Headers `X-App-Id` and `X-App-Password` must equal `EXT_APP_ID` / `EXT_APP_PASSWORD` | `401 {"error":"Invalid App ID or Password"}` |
-| IP allow-list| Caller IP must exist for the **exact** request path in `ictcell.ext_api_allowed_ips` (`is_active = true`) | `403 {"error":"IP address not allowed ..."}` |
+| IP allow-list| Caller IP must exist for the **exact** request path in `attendance.ext_api_allowed_ips` (`is_active = true`) | `403 {"error":"IP address not allowed ..."}` |
 
 > The IP check is per endpoint path. Add a row for each of
 > `/ext-api/wow-attendance/enroll`, `/ext-api/wow-attendance/enrolled`,

@@ -29,10 +29,12 @@ What moved, what stayed, and how to cut over without an outage.
 
 New in the split, with no counterpart in duerp-api:
 
-- `sql/000_ext_api_infra.sql` — reconstructs `ext_api_allowed_ips` and
-  `ext_api_call_logs` so a **fresh** database can run this service alone. It is
-  a no-op against the shared production database, where both tables already
-  exist.
+- `sql/000_ext_api_infra.sql` — creates `attendance.ext_api_allowed_ips` and
+  `attendance.ext_api_call_logs` so a **fresh** database can run this service
+  alone. Originally it reconstructed the shared `ictcell` pair and was a no-op
+  against production; `sql/005_ext_api_attendance_schema.sql` since moved this
+  service onto its own copies in `attendance`, and 005 is what carries the real
+  client IPs and the call history over. duerp-api keeps the `ictcell` pair.
 - `GET /health` — a standalone service behind a proxy needs a cheap
   unauthenticated liveness probe; the monolith was checked through its UI.
 - `ATTENDANCE_BIND` / `ATTENDANCE_PORT` / `DB_MAX_CONNECTIONS` — the monolith
@@ -171,9 +173,10 @@ Two things are easy to get wrong here:
 both files carry a comment saying so.
 
 duerp-api's logs deliberately record body *shape* (`JSON keys: [std_id]`), never
-body values, and never headers — the full payload already goes to
-`ictcell.ext_api_call_logs`, which sits behind database access rather than on a
-shared uploads volume. `middleware::api_logger`'s test asserts credentials and
+body values, and never headers — the full payload already goes to an
+`ext_api_call_logs` table (`attendance` for this service since
+`sql/005_ext_api_attendance_schema.sql`, `ictcell` for duerp-api), which sits
+behind database access rather than on a shared uploads volume. `middleware::api_logger`'s test asserts credentials and
 request values stay out of the file.
 
 ---
@@ -226,7 +229,7 @@ Order matters: **start the new service before you stop serving the old paths.**
 7. **Watch.** For the first day:
    ```sql
    SELECT endpoint, status_code, count(*)
-     FROM ictcell.ext_api_call_logs
+     FROM attendance.ext_api_call_logs
     WHERE created_at > now() - interval '1 hour'
       AND endpoint LIKE '/ext-api/wow-attendance%'
     GROUP BY 1, 2 ORDER BY 3 DESC;

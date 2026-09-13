@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "WOW Attendance (ext-api)",
-    "description": "Face-based attendance endpoints. Every request requires the X-App-Id / X-App-Password headers (ExtAuthMiddleware), the caller IP must be allow-listed in ictcell.ext_api_allowed_ips for each endpoint, AND an `Authorization: Bearer <jwt>` header — the DU login access_token (from local.duwebadmin.com/api/login; its `sub` is the DU user id). On `enroll` the backend decodes that token WITHOUT verifying its signature (it is signed with DU's own secret) to read `sub`, then resolves id_type (Student/Employee) by calling the DU `getUserInfo` endpoint with that user id — id_type is NOT sent in the request. Images are limited to WOW_MAX_IMAGE_MB (default 5 MB).",
+    "description": "Face-based attendance endpoints. Every request requires the X-App-Id / X-App-Password headers (ExtAuthMiddleware), the caller IP must be allow-listed in attendance.ext_api_allowed_ips for each endpoint, AND an `Authorization: Bearer <jwt>` header — the DU login access_token (from local.duwebadmin.com/api/login; its `sub` is the DU user id). On `enroll` the backend decodes that token WITHOUT verifying its signature (it is signed with DU's own secret) to read `sub`, then resolves id_type (Student/Employee) by calling the DU `getUserInfo` endpoint with that user id — id_type is NOT sent in the request. Images are limited to WOW_MAX_IMAGE_MB (default 5 MB).",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [

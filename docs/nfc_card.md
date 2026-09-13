@@ -89,14 +89,14 @@ The IP allow-list used to scope that to trusted readers; it no longer does. See
 > ```sql
 > -- what the migration leaves in place
 > SELECT endpoint, ip_address, is_active
->   FROM ictcell.ext_api_allowed_ips
+>   FROM attendance.ext_api_allowed_ips
 >  WHERE endpoint LIKE '/ext-api/nfc-card/%';   -- ip_address = {*}
 > ```
 >
 > To scope them back to real readers, replace the wildcard with their IPs:
 >
 > ```sql
-> UPDATE ictcell.ext_api_allowed_ips
+> UPDATE attendance.ext_api_allowed_ips
 >    SET ip_address = '{203.0.113.10,203.0.113.11}'::text[]
 >  WHERE endpoint IN ('/ext-api/nfc-card/get_card_info',
 >                     '/ext-api/nfc-card/save_card_info');
@@ -337,7 +337,7 @@ Every write leaves a row in **`attendance.nfc_card_audit`**: `action`
 (`created` / `updated` / `unassigned`), the card number, the flags,
 `changed_fields`, `performed_by` (the token's `sub`) and `client_ip`.
 
-The step logs and `ictcell.ext_api_call_logs` already record the *calls*; this
+The step logs and `attendance.ext_api_call_logs` already record the *calls*; this
 table answers the question they cannot — **who held this card before, and when
 did it move**. A rejected save writes nothing, so the trail never implies a
 change that did not happen.
@@ -499,7 +499,7 @@ two paths. If it is, the row is missing or `is_active = false` — the check
 matches the **full path**, and each endpoint needs its own row:
 
 ```sql
-UPDATE ictcell.ext_api_allowed_ips
+UPDATE attendance.ext_api_allowed_ips
    SET ip_address = ip_address || '{*}'::text[], is_active = true
  WHERE endpoint IN ('/ext-api/nfc-card/get_card_info',
                     '/ext-api/nfc-card/save_card_info');

@@ -124,7 +124,7 @@ where
                 tokio::spawn(async move {
                     let result = sqlx::query(
                         r#"
-                        INSERT INTO ictcell.ext_api_call_logs
+                        INSERT INTO attendance.ext_api_call_logs
                             (endpoint, method, request_body, response_body,
                              status_code, duration_ms, client_ip, user_agent, error_message)
                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)

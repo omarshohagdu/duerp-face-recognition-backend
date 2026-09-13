@@ -155,7 +155,7 @@ COMMENT ON TABLE attendance.nfc_student_cards IS
 -- 3 · Audit trail
 --
 -- Business-logic step 6 of the spec ("log who saved it, when, which fields
--- changed"). The step logs and `ictcell.ext_api_call_logs` already record the
+-- changed"). The step logs and `attendance.ext_api_call_logs` already record the
 -- calls, but neither answers the question this table exists for: who held this
 -- card before, and when did it move. Reassignment makes that history the
 -- point, so it gets a table rather than a grep.
@@ -465,7 +465,7 @@ $function$;
 -- 6 · Seed the ext-api IP allow-list — OPEN TO ALL IPs
 --
 -- ExtAuthMiddleware runs before every /ext-api handler and matches the FULL
--- request path against `ictcell.ext_api_allowed_ips`. Without a row here every
+-- request path against `attendance.ext_api_allowed_ips`. Without a row here every
 -- call to these two endpoints is a 403 before the handler is ever reached.
 --
 -- These two carry `'*'`, the wildcard the middleware reads as "any IP"
@@ -480,7 +480,7 @@ $function$;
 -- that is acceptable depends entirely on the network the service is exposed on.
 --
 -- TO PUT THE ALLOW-LIST BACK, list the real IPs and drop the wildcard:
---   UPDATE ictcell.ext_api_allowed_ips
+--   UPDATE attendance.ext_api_allowed_ips
 --      SET ip_address = '{203.0.113.10,203.0.113.11}'::text[]
 --    WHERE endpoint IN ('/ext-api/nfc-card/get_card_info',
 --                       '/ext-api/nfc-card/save_card_info');
@@ -489,14 +489,14 @@ $function$;
 -- `endpoint`, so an ON CONFLICT target would abort the script there.
 -- ---------------------------------------------------------------------
 
-INSERT INTO ictcell.ext_api_allowed_ips (endpoint, ip_address)
+INSERT INTO attendance.ext_api_allowed_ips (endpoint, ip_address)
 SELECT v.endpoint, '{*}'::text[]
   FROM (VALUES
     ('/ext-api/nfc-card/get_card_info'),
     ('/ext-api/nfc-card/save_card_info')
   ) AS v(endpoint)
  WHERE NOT EXISTS (
-    SELECT 1 FROM ictcell.ext_api_allowed_ips a
+    SELECT 1 FROM attendance.ext_api_allowed_ips a
      WHERE a.endpoint = v.endpoint
  );
 
@@ -504,7 +504,7 @@ SELECT v.endpoint, '{*}'::text[]
 -- database this has run against before is both of them. Open those too, and
 -- re-activate any that were switched off — idempotent, so re-running this file
 -- is safe.
-UPDATE ictcell.ext_api_allowed_ips
+UPDATE attendance.ext_api_allowed_ips
    SET ip_address = ip_address || '{*}'::text[],
        is_active  = true
  WHERE endpoint IN ('/ext-api/nfc-card/get_card_info',
