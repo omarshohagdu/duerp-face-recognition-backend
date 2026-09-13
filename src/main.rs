@@ -21,6 +21,57 @@ use actix_web::{web, App, HttpResponse, HttpServer};
 use dotenvy::dotenv;
 use utils::db;
 
+/// Load `.env`, and SAY WHAT HAPPENED.
+///
+/// `dotenvy::dotenv()` searches upward from the CURRENT WORKING DIRECTORY. It
+/// therefore finds nothing whenever the service is started from anywhere but
+/// the crate root — which under systemd is the default unless the unit sets
+/// `WorkingDirectory`, and is always the case under docker.
+///
+/// This used to be `dotenv().ok()`, which threw that failure away. The first
+/// symptom was `get_db_pool` panicking with `DATABASE_URL not set: NotPresent`
+/// on a restart loop — a message that names neither the file that was missing
+/// nor the directory that was searched, and so sends you looking at the
+/// database instead of at the working directory. One line here is what that
+/// cost.
+///
+/// `ENV_FILE` takes an absolute path and skips the search entirely. That is
+/// the reliable way to run this from an arbitrary working directory; it is
+/// also the fastest fix when this has already gone wrong in production.
+///
+/// Not finding a file is NOT fatal: `EnvironmentFile=` in a systemd unit and
+/// `--env-file` in docker both populate the real process environment, and in
+/// those deployments there is correctly no `.env` to find. Only a genuinely
+/// missing variable is fatal, and that is reported where it is read.
+fn load_env() {
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+
+    match std::env::var("ENV_FILE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(path) => match dotenvy::from_path(&path) {
+            Ok(()) => println!("config: loaded {path} (ENV_FILE)"),
+            Err(e) => eprintln!(
+                "config: ENV_FILE={path} could not be read ({e}) — \
+                 continuing with the process environment only"
+            ),
+        },
+        None => match dotenv() {
+            Ok(path) => println!("config: loaded {}", path.display()),
+            Err(_) => eprintln!(
+                "config: no .env found searching up from {cwd} — continuing with the \
+                 process environment only. That is correct under systemd \
+                 (EnvironmentFile=) or docker (--env-file); if neither is in play, \
+                 set ENV_FILE=/absolute/path/to/.env or give the unit a \
+                 WorkingDirectory."
+            ),
+        },
+    }
+}
+
 /// Liveness probe. Standalone services sit behind a proxy / systemd unit that
 /// needs a cheap non-authenticated endpoint to poll; the ERP monolith never had
 /// one because it was checked through its UI.
@@ -34,7 +85,7 @@ async fn health() -> HttpResponse {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    dotenv().ok();
+    load_env();
     env_logger::init();
 
     let db_pool = db::get_db_pool().await;

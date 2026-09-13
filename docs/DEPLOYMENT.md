@@ -219,6 +219,47 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 ```
 
+### If it restart-loops on `DATABASE_URL is not set`
+
+The service reads config from the process environment. That environment is
+populated by **one** of three things, and the first line it logs says which one
+it found:
+
+```
+config: loaded /var/www/.../.env            # a .env was found from the working directory
+config: loaded /etc/duerp/attendance.env (ENV_FILE)
+config: no .env found searching up from /   # nothing found — fine ONLY if EnvironmentFile= is set
+```
+
+`dotenvy` searches upward from the **working directory**, so a unit without
+`WorkingDirectory=` finds no `.env` at all. Both keys above are in the unit for
+that reason — `WorkingDirectory=` for the search, `EnvironmentFile=` so it works
+even without it. Check, in order:
+
+```bash
+systemctl show duerp-attendance -p WorkingDirectory -p EnvironmentFiles
+sudo -u www-data test -r /var/www/face_recognition/duerp-face-recognition-backend/.env \
+  && echo "readable" || echo "MISSING or unreadable by the service user"
+```
+
+**`.env` is gitignored** (`.gitignore:31`), so `git pull` does **not** carry it
+onto a new host — a fresh deploy has no `.env` even though the repo looks
+complete. Copy `.env.example` to `.env` there and fill it in.
+
+To run from an arbitrary working directory, set `ENV_FILE` to an absolute path;
+it skips the search entirely and is the quickest fix when this is already
+failing in production:
+
+```ini
+Environment=ENV_FILE=/var/www/face_recognition/duerp-face-recognition-backend/.env
+```
+
+Note `EnvironmentFile=` and `ENV_FILE=` differ on quoting: systemd strips
+surrounding quotes from a value, and so does dotenvy, but a plain
+`export $(grep ... .env)` in a shell does **not** — `EXT_APP_PASSWORD` is
+single-quoted in this file, which is why hand-rolled shell sourcing yields
+`401 Invalid App ID or Password`.
+
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now duerp-attendance
