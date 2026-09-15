@@ -9,7 +9,7 @@ Two endpoints:
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` (or `GET`) | `/ext-api/nfc-card/get_card_info` | Scan lookup → applicant id, card number, and the two flags with readable labels. Nothing else: it is called on every tap, so the payload stays small and free of PII. |
-| `POST` | `/ext-api/nfc-card/save_card_info` | Create or update a student's card record, including uploaded images. |
+| `POST` | `/ext-api/nfc-card/save_card_info` | Create or update a student's card record. Always carries a card photo **and** a selfie, and saves only if a face-match service says they are the same person. |
 
 Every call needs **three** things: the app credentials, an allow-listed IP, and
 a bearer token. If you are looking at an error right now, jump to
@@ -216,12 +216,55 @@ endpoint reports the mapping, it does not police it.
 | `is_verified` | `1` \| `2` | No, default `2` | `1 = Verified`, `2 = Not Verified`. Forced to `2` when `registration_type = 2` |
 | `registration_type` | `1` \| `2` | Yes | `1 = Admin`, `2 = Self` |
 | `force_reassign` | `true`/`1`/`yes`/`on` | No, default off | Move a card off its current holder — see below |
-| `card_image` | file | No | Photo of the physical card |
-| `student_selfie` | file | No | Student's selfie |
+| `card_image` | file | **Yes** | Photo of the physical card — the face on it is one half of the match |
+| `student_selfie` | file | **Yes** | Student's selfie — the other half |
 
 The scalar fields are also accepted as **query parameters**, because several
 HTTP clients drop the query string on a multipart POST and some send the scalars
-there anyway. The body wins when both are present.
+there anyway. The body wins when both are present. The two files have no query
+equivalent — they must be in the body.
+
+### The face-match gate
+
+**Both images are required on every save, and they must be the same person.**
+Before anything is written, the pair is sent to the face-match service:
+
+```
+POST $NFC_FACE_VERIFY_URL          # e.g. http://10.224.224.101:8089/verify
+X-API-Key: $NFC_FACE_VERIFY_API_KEY
+card_image=@…  selfie_image=@…     # multipart/form-data
+```
+
+It answers with a verdict:
+
+```json
+{ "match": true, "similarity": 0.562791, "threshold": 0.36,
+  "model": "insightface", "message": "MATCH — same person" }
+```
+
+Only an explicit `"match": true` lets the save proceed. Everything else stops
+it, and **nothing is written** — the card record is untouched and no row is
+created. The uploaded files stay on disk, referenced by nothing, the same way a
+rejected upload is kept for audit.
+
+The gate **fails closed**. A mismatch, a photo with no detectable face, a
+service that is down, a 5xx, a rejected API key, a reply that carries no
+`match` field, or an unset `NFC_FACE_VERIFY_URL` all mean "no verdict", and no
+verdict means no save. This is deliberate: a card mapping that was never
+face-checked is exactly what the gate exists to prevent, so an outage stops
+card registration rather than quietly letting unchecked pairs through. **If
+saves start failing with 503 `face_verify_unavailable`, the face service — not
+this one — is what to look at.**
+
+Two consequences worth planning for:
+
+- **A metadata-only update is no longer possible.** Flipping `is_verified` to
+  `1` means re-sending both photos, because a save with no files cannot be
+  face-checked. (The SQL function still keeps a stored image when one is
+  omitted, but that path is no longer reachable through this endpoint.)
+- **The check is in the handler, not in SQL.** Postgres cannot make the HTTP
+  call, so — unlike normalisation, the `1`/`2` enums and the card-ownership
+  rules — a DBA calling `attendance.nfc_card_save_info` directly bypasses it.
 
 ### Success — `200 OK`
 
@@ -268,11 +311,34 @@ there anyway. The body wins when both are present.
 | 400 | `invalid_value` | `is_verified`/`registration_type` not `1` or `2`, or applicant id over 64 chars |
 | 400 | `invalid_card_number` | Under 4 or over 64 chars after normalisation |
 | 400 | `invalid_image` | Upload's magic bytes are not a known image format |
+| 400 | `missing_images` | `card_image` and/or `student_selfie` not sent — both are required |
+| 400 | `face_mismatch` | The two photos are different people. `data` carries `similarity`, `threshold` and the service's own `detail` |
+| 400 | `face_not_comparable` | The service could not compare them — usually no detectable face in one. Its wording is passed through as the `message` |
 | 400 | `bad_multipart` | Malformed multipart body |
 | 409 | `card_conflict` | Card is assigned to a **different** student — `data.assigned_to` names them |
 | 413 | `image_too_large` | An image exceeds `WOW_MAX_UPLOAD_MB` (default 25 MB) |
 | 401 / 403 | — | Auth layers above |
 | 500 | `internal_error` | Database or file-storage error |
+| 503 | `face_verify_unavailable` | No verdict was obtained — service down, timed out, 5xx, API key rejected, unreadable reply, or `NFC_FACE_VERIFY_URL` unset. **Not the caller's fault**; nothing was written |
+
+A rejected pair looks like this:
+
+```json
+{
+  "status": "error",
+  "code": "face_mismatch",
+  "message": "The student selfie does not match the face on the card image; card not saved",
+  "data": {
+    "match": false,
+    "similarity": 0.187816,
+    "threshold": 0.36,
+    "detail": "NO MATCH — different people"
+  }
+}
+```
+
+`code` is the stable part — match on it. `message` and `data.detail` are prose;
+`data.detail` comes from the face service and may be reworded there.
 
 ### Behaviour worth knowing
 
@@ -280,11 +346,11 @@ there anyway. The body wins when both are present.
 forces `is_verified = 2` whatever was passed in, and reports it in `warnings`.
 Enforced in SQL, so it holds for every caller.
 
-**Omitting an image keeps the stored one.** A save that sends no `card_image`
-leaves the existing path in place (`COALESCE`, not overwrite). This is what makes
-the verification step safe: an admin flipping `is_verified` sends no files and
-must not thereby wipe the photos the previous save uploaded. There is
-consequently **no way to clear an image** through this endpoint.
+**Omitting an image is rejected, not tolerated.** Both files are required —
+see [the face-match gate](#the-face-match-gate). Underneath, the SQL function
+still keeps a stored image when one is omitted (`COALESCE`, not overwrite), so
+a direct caller cannot wipe a photo by leaving it out, and there is **no way to
+clear an image** through this endpoint either.
 
 **A repeated save is an update, not a second row** — the upsert is on
 `student_applicant_id`, and re-scanning the card you already hold is idempotent.
@@ -403,6 +469,9 @@ lands.
 | `WOW_MAX_UPLOAD_MB` | 25 | Per-image ceiling. Shared with the face module. |
 | `WOW_MAX_IMAGE_MB` | 5 | Images above this are compressed down in place after upload. |
 | `WOW_LOG_DIR` | `./uploads/log` | Per-call step logs, one file per call. |
+| `NFC_FACE_VERIFY_URL` | *(unset)* | Face-match endpoint for `save_card_info`, e.g. `http://10.224.224.101:8089/verify`. **Unset means every save is rejected** with 503 — the gate fails closed. |
+| `NFC_FACE_VERIFY_API_KEY` | *(empty)* | Sent as `X-API-Key` to that service. A rejected key is a 503, not a 400. |
+| `NFC_FACE_VERIFY_TIMEOUT_SECS` | 30 | Timeout for the match call. It bounds a save, so keep it under the proxy read timeout in front of this service. |
 
 These are not NFC-specific but every call fails without them:
 
@@ -528,6 +597,35 @@ failure it records the method, `Content-Type` and body byte count in the
 `body:` line under `Params:`. Absence of that line with a non-zero body size
 means the encoding wasn't recognised.
 
+### `503 face_verify_unavailable` on every save
+
+The face-match gate got no verdict, so nothing was written. In order of how
+often it is the cause:
+
+```bash
+# 1 · Is the URL configured at all? Unset = every save rejected, by design.
+grep NFC_FACE_VERIFY .env
+
+# 2 · Is the service reachable from THIS host? (the reader's network is
+#     irrelevant — this service makes the call, not the reader)
+curl -s -m 30 -H "X-API-Key: $NFC_FACE_VERIFY_API_KEY" "$NFC_FACE_VERIFY_URL" \
+  -F "card_image=@card.jpg" -F "selfie_image=@selfie.jpg"
+```
+
+- `{"detail":"Invalid or missing API key."}` → `NFC_FACE_VERIFY_API_KEY` is
+  wrong. The gate reports this as a 503 rather than a 400 on purpose: it is
+  this service's credential, and no photo the student retakes will fix it.
+- A hang or connection refused → the face service is down, or a firewall sits
+  between it and this host. Card registration stays stopped until it is back;
+  that is the fail-closed behaviour, not a bug.
+- A verdict comes back fine here but saves still 503 → read the step log for
+  the call (below). The `Response (AI /verify)` line holds exactly what the
+  service answered this service.
+
+A **400** `face_mismatch` or `face_not_comparable` is a different thing: the
+gate worked and the photos are the problem. `face_not_comparable` usually means
+no detectable face — a glare-washed card photo or a cropped selfie.
+
 ### Reading the step log for one call
 
 Every call writes one file to `WOW_LOG_DIR`, named `{id}_{timestamp}.log`, with
@@ -561,6 +659,7 @@ Read them on the box, or through the gated
 | `save_card_info` auth "admin/staff role" | Bearer token only | This service has no role to check — the token carries only `sub` and `exp`. See the warning under [Auth](#auth). |
 | Attendance check-in on scan (open question) | Not implemented | `get_card_info` is a pure lookup; check-in stays a separate downstream call. |
 | Image storage backend (open question) | Local disk under the served `uploads` tree | Matches how the face module already stores images; no S3/GCS credentials exist in this service. |
+| `card_image` / `student_selfie` are just stored | Both **required**, and face-matched against each other before the row is written | Requested: storing a card photo and a selfie proves nothing if nobody compares them. The pair goes to `NFC_FACE_VERIFY_URL` and only `match: true` saves — see [the face-match gate](#the-face-match-gate). |
 
 ---
 
@@ -585,7 +684,8 @@ curl -s "${AUTH[@]}" -X POST "$BASE/ext-api/nfc-card/get_card_info" \
 # GET still works, for a client written against the spec
 curl -s "${AUTH[@]}" "$BASE/ext-api/nfc-card/get_card_info?card_number=04A1B2C3D4E5"
 
-# Assign a card, with both images, as an admin
+# Assign a card, as an admin. Both images are required on EVERY save: they
+# are what the face-match gate compares before anything is written.
 curl -s "${AUTH[@]}" -X POST "$BASE/ext-api/nfc-card/save_card_info" \
   -F "student_applicant_id=APP-2026-00123" \
   -F "card_number=04:A1:B2:C3:D4:E5" \
@@ -594,16 +694,28 @@ curl -s "${AUTH[@]}" -X POST "$BASE/ext-api/nfc-card/save_card_info" \
   -F "card_image=@card.jpg" \
   -F "student_selfie=@selfie.jpg"
 
-# Verify an existing record — no files, so the stored images are kept
+# Mark an existing record verified — still needs both photos, because a save
+# with no files cannot be face-checked. Sending them again is harmless: the
+# upsert is on student_applicant_id, so this updates the row rather than adding one.
 curl -s "${AUTH[@]}" -X POST "$BASE/ext-api/nfc-card/save_card_info" \
   -F "student_applicant_id=APP-2026-00123" \
   -F "card_number=04A1B2C3D4E5" \
-  -F "is_verified=1" -F "registration_type=1"
+  -F "is_verified=1" -F "registration_type=1" \
+  -F "card_image=@card.jpg" \
+  -F "student_selfie=@selfie.jpg"
 
 # Re-issue the same physical card to a different student
 curl -s "${AUTH[@]}" -X POST "$BASE/ext-api/nfc-card/save_card_info" \
   -F "student_applicant_id=APP-2026-00777" \
   -F "card_number=04A1B2C3D4E5" \
   -F "registration_type=1" \
-  -F "force_reassign=true"
+  -F "force_reassign=true" \
+  -F "card_image=@card.jpg" \
+  -F "student_selfie=@selfie.jpg"
+
+# What the face-match service is asked, in isolation — useful when a save is
+# failing and you want to know whether the gate or this service is the problem.
+curl -s -H "X-API-Key: $NFC_FACE_VERIFY_API_KEY" "$NFC_FACE_VERIFY_URL" \
+  -F "card_image=@card.jpg" \
+  -F "selfie_image=@selfie.jpg"
 ```

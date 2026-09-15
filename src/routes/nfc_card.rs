@@ -15,6 +15,13 @@
 //! the multipart body, store the images on disk, map the function's `code`
 //! onto a status, and turn stored paths into public URLs.
 //!
+//! It owns one rule of its own: a save must carry a `card_image` and a
+//! `student_selfie`, and the two must be the same face. That check is a call
+//! to the face-match service (`NFC_FACE_VERIFY_URL`) and happens BEFORE the
+//! SQL function is reached, so a rejected pair leaves no row. It lives here
+//! rather than in SQL because Postgres cannot make the HTTP call — which means
+//! a DBA writing the row directly bypasses it, unlike every other rule above.
+//!
 //! AUTH is the bearer token, on top of the `X-App-Id` / `X-App-Password` +
 //! IP allow-list gate `ExtAuthMiddleware` already applies to everything under
 //! `/ext-api`. Note what that means for `force_reassign` — any holder of a
@@ -41,6 +48,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::path::Path;
+use std::sync::LazyLock;
+use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -158,6 +167,276 @@ fn status_for_code(code: &str) -> actix_web::http::StatusCode {
         "card_not_found" => StatusCode::NOT_FOUND,
         "card_conflict" => StatusCode::CONFLICT,
         _ => StatusCode::BAD_REQUEST,
+    }
+}
+
+// ---------------------------------------------------------------------
+// Face-match gate
+//
+// A card photo and a selfie only mean something together: the pair is what
+// ties the student in front of the reader to the card being registered. That
+// comparison is not made here — it is delegated to the face-match service at
+// `NFC_FACE_VERIFY_URL`, which answers `match: true|false` for a `card_image`
+// + `selfie_image` pair.
+//
+// The gate FAILS CLOSED. Anything short of an explicit `match: true` — a
+// mismatch, a photo with no detectable face, an unreachable service, an unset
+// URL — leaves the row unwritten. A card mapping that was never face-checked
+// is the thing this gate exists to prevent, so "the checker was down" must not
+// quietly become "saved anyway"; a save during an outage is an operator
+// problem, not a silent one.
+// ---------------------------------------------------------------------
+
+/// Face-match endpoint, e.g. `http://10.224.224.101:8089/verify`.
+///
+/// `None` when unset, which rejects every save rather than letting unchecked
+/// pairs through — see the fail-closed note above.
+fn face_verify_url() -> Option<String> {
+    std::env::var("NFC_FACE_VERIFY_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Sent as `X-API-Key`. A missing key is forwarded as an empty header rather
+/// than omitted, so the failure surfaces as the service's own 401 in the step
+/// log instead of as a differently-shaped request.
+fn face_verify_api_key() -> String {
+    std::env::var("NFC_FACE_VERIFY_API_KEY").unwrap_or_default()
+}
+
+/// Request timeout, `NFC_FACE_VERIFY_TIMEOUT_SECS` (default 30s).
+///
+/// It bounds a save: the caller is standing at a reader with the images
+/// already on disk, so a stalled comparison has to become a 503 promptly
+/// rather than hold the request open.
+fn face_verify_timeout() -> Duration {
+    let secs = std::env::var("NFC_FACE_VERIFY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(30);
+    Duration::from_secs(secs)
+}
+
+/// Shared client for the face-match service: connection + TLS reuse across
+/// saves, and the timeout applied in one place.
+static FACE_VERIFY_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(face_verify_timeout())
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+});
+
+/// 503 for "no verdict was obtained". Its own helper because the code string
+/// has four call sites and a typo in one would read as a different failure.
+fn face_verify_unavailable(message: &str) -> HttpResponse {
+    HttpResponse::ServiceUnavailable().json(fail("face_verify_unavailable", message))
+}
+
+/// Filename and MIME to forward one stored image under.
+///
+/// Both come from the magic bytes, never from the stored name: the uploaded
+/// name is client text, and `reduce_saved_image` may have re-encoded the file
+/// to JPEG without the extension following. The receiving service parses the
+/// part's filename, so it gets a plain ASCII one.
+fn forward_name_and_mime(field: &str, head: &[u8]) -> (String, &'static str) {
+    let (ext, mime) = match detect_image_format(head) {
+        "PNG" => ("png", "image/png"),
+        "WEBP" => ("webp", "image/webp"),
+        "BMP" => ("bmp", "image/bmp"),
+        "HEIC" => ("heic", "image/heic"),
+        "HEIF" => ("heif", "image/heif"),
+        "AVIF" => ("avif", "image/avif"),
+        _ => ("jpg", "image/jpeg"),
+    };
+    (format!("{field}.{ext}"), mime)
+}
+
+/// Read a stored upload back off disk as a multipart part.
+async fn forward_part(field: &str, path: &str) -> Result<reqwest::multipart::Part, String> {
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|e| format!("read {path}: {e}"))?;
+    let (filename, mime) = forward_name_and_mime(field, &bytes[..bytes.len().min(16)]);
+    reqwest::multipart::Part::bytes(bytes)
+        .file_name(filename)
+        .mime_str(mime)
+        .map_err(|e| e.to_string())
+}
+
+/// The human-readable half of the face service's reply.
+///
+/// It answers in two shapes: `detail` — a string for a rejection, a list of
+/// `{msg: …}` for a schema error — and `message`, the prose beside `match`.
+/// Worth passing on, because "No face detected in 'card_image'" tells a
+/// student to retake the photo and a generic message would not.
+fn face_verify_message(body: &Value) -> Option<String> {
+    match body.get("detail") {
+        Some(Value::String(s)) if !s.trim().is_empty() => return Some(s.trim().to_string()),
+        Some(Value::Array(items)) => {
+            let joined = items
+                .iter()
+                .filter_map(|i| i.get("msg").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("; ");
+            if !joined.is_empty() {
+                return Some(joined);
+            }
+        }
+        _ => {}
+    }
+    body.get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Compare the two uploads and say whether the save may go ahead.
+///
+/// `Ok(())` only on an explicit `match: true`. Everything else is an
+/// `Err(response)` the handler returns unchanged:
+///
+///   400 `face_mismatch`           — compared, and they are different people
+///   400 `face_not_comparable`     — could not be compared (no face in one)
+///   503 `face_verify_unavailable` — no verdict at all (unset, down, 5xx, 401)
+///
+/// The split is what the caller acts on: the first two are answered by
+/// retaking a photo, the third only by an operator.
+async fn verify_card_selfie_match(
+    log: &StepLogger,
+    card_path: &str,
+    selfie_path: &str,
+) -> Result<(), HttpResponse> {
+    let Some(url) = face_verify_url() else {
+        log.step("NFC_FACE_VERIFY_URL is not set — refusing the save (gate fails closed)");
+        return Err(face_verify_unavailable(
+            "Face verification is not configured; card not saved",
+        ));
+    };
+
+    let mut form = reqwest::multipart::Form::new();
+    for (field, path) in [("card_image", card_path), ("selfie_image", selfie_path)] {
+        match forward_part(field, path).await {
+            Ok(part) => form = form.part(field, part),
+            Err(e) => {
+                log.step(format!(
+                    "{field} could not be read back for verification: {e}"
+                ));
+                return Err(face_verify_unavailable(
+                    "Face verification could not read the uploaded images",
+                ));
+            }
+        }
+    }
+
+    log.step(format!(
+        "verifying card_image against student_selfie: POST {url}"
+    ));
+    let resp = match FACE_VERIFY_CLIENT
+        .post(&url)
+        .header("X-API-Key", face_verify_api_key())
+        .multipart(form)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            log.step(format!("face verification request FAILED: {e}"));
+            return Err(face_verify_unavailable(
+                "Face verification service is unavailable; card not saved",
+            ));
+        }
+    };
+
+    let status = resp.status();
+    let raw = resp.text().await.unwrap_or_default();
+    let body: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => {
+            // Logged as the raw text, not dropped: a gateway's HTML error page
+            // is the whole explanation when the service itself never answered.
+            log.ai_response("/verify", status.as_u16(), &json!({ "non_json_body": raw }));
+            log.step("face verification replied with a non-JSON body — refusing the save");
+            return Err(face_verify_unavailable(
+                "Face verification returned an unreadable response; card not saved",
+            ));
+        }
+    };
+    // Logged before the branches below, so a rejected pair is recorded in full
+    // too — that reply is the one worth reading afterwards.
+    log.ai_response("/verify", status.as_u16(), &body);
+
+    // Our credentials, not the caller's photos: answering 400 here would send
+    // a student off to retake a selfie over a misconfigured API key.
+    if matches!(status.as_u16(), 401 | 403) {
+        log.step("face verification rejected this service's API key — refusing the save");
+        return Err(face_verify_unavailable(
+            "Face verification credentials were rejected; card not saved",
+        ));
+    }
+    if status.is_server_error() {
+        log.step(format!(
+            "face verification failed upstream ({}) — refusing the save",
+            status.as_u16()
+        ));
+        return Err(face_verify_unavailable(
+            "Face verification service is unavailable; card not saved",
+        ));
+    }
+    // A 4xx here means the request was read but the pair could not be
+    // compared — usually no detectable face in one of the photos. The
+    // service's own wording is the actionable one.
+    if status.is_client_error() {
+        let message = face_verify_message(&body)
+            .unwrap_or_else(|| "Face verification could not compare the images".to_string());
+        log.step(format!(
+            "face verification could not compare the images ({}) — returning 400",
+            status.as_u16()
+        ));
+        return Err(HttpResponse::BadRequest().json(fail("face_not_comparable", message)));
+    }
+
+    let null = Value::Null;
+    log.step(format!(
+        "face verification verdict: match={} similarity={} threshold={}",
+        body.get("match").unwrap_or(&null),
+        body.get("similarity").unwrap_or(&null),
+        body.get("threshold").unwrap_or(&null),
+    ));
+
+    match body.get("match").and_then(Value::as_bool) {
+        Some(true) => Ok(()),
+        Some(false) => {
+            // Our own message, because `code` is the contract and the
+            // service's prose may be reworded; its wording and the scores ride
+            // along in `data` for the UI and for anyone reading a screenshot.
+            let mut out = fail(
+                "face_mismatch",
+                "The student selfie does not match the face on the card image; card not saved",
+            );
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert(
+                    "data".to_string(),
+                    json!({
+                        "match":      false,
+                        "similarity": body.get("similarity").cloned().unwrap_or(Value::Null),
+                        "threshold":  body.get("threshold").cloned().unwrap_or(Value::Null),
+                        "detail":     face_verify_message(&body),
+                    }),
+                );
+            }
+            Err(HttpResponse::BadRequest().json(out))
+        }
+        // A 200 with no `match` field is not a verdict. Fails closed with the
+        // other no-verdict cases rather than being read as either answer.
+        None => {
+            log.step("face verification reply carried no `match` field — refusing the save");
+            Err(face_verify_unavailable(
+                "Face verification returned an unexpected response; card not saved",
+            ))
+        }
     }
 }
 
@@ -738,6 +1017,27 @@ async fn nfc_save_card_info_inner(
         ));
     }
 
+    // ── The face-match gate ──────────────────────────────────────────
+    // Both photos are required on EVERY save, including one that only flips
+    // `is_verified`: the pair is what the gate below compares, and a save that
+    // could omit them would be a save that skips the check. The row keeps its
+    // stored images when a save omits one (COALESCE, in SQL), but that path is
+    // no longer reachable through this endpoint.
+    let (Some(card_img), Some(selfie_img)) = (card_image.as_ref(), student_selfie.as_ref()) else {
+        log.step("card_image and/or student_selfie missing — returning 400");
+        return HttpResponse::BadRequest().json(fail(
+            "missing_images",
+            "card_image and student_selfie are both required",
+        ));
+    };
+
+    // Before the write, never after: a pair the service rejects must leave no
+    // row behind. The files stay on disk either way, like every other rejected
+    // upload here, and are referenced by nothing.
+    if let Err(resp) = verify_card_selfie_match(log, &card_img.path, &selfie_img.path).await {
+        return resp;
+    }
+
     let force_reassign = parse_bool(force_reassign_raw.as_deref());
     let stored_paths: Vec<&str> = [card_image.as_ref(), student_selfie.as_ref()]
         .iter()
@@ -898,6 +1198,74 @@ mod tests {
         // every caller; this only rejects what is not a number at all.
         assert_eq!(parse_flag(Some("3")), Ok(Some(3)));
         assert_eq!(parse_flag(Some("0")), Ok(Some(0)));
+    }
+
+    #[test]
+    fn forward_name_and_mime_reads_the_magic_bytes() {
+        // What the part is labelled with must follow the bytes, not the
+        // stored extension: `reduce_saved_image` re-encodes to JPEG and a
+        // client can name a PNG anything at all.
+        let png = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        assert_eq!(
+            forward_name_and_mime("card_image", &png),
+            ("card_image.png".to_string(), "image/png")
+        );
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0];
+        assert_eq!(
+            forward_name_and_mime("selfie_image", &jpeg),
+            ("selfie_image.jpg".to_string(), "image/jpeg")
+        );
+    }
+
+    #[test]
+    fn forward_name_and_mime_falls_back_to_jpeg() {
+        // Unrecognised bytes can't reach here — `is_supported_image` rejected
+        // them at upload — so the fallback only has to be a valid label.
+        assert_eq!(
+            forward_name_and_mime("card_image", &[0, 1, 2, 3]),
+            ("card_image.jpg".to_string(), "image/jpeg")
+        );
+    }
+
+    #[test]
+    fn face_verify_message_reads_a_string_detail() {
+        // The shape a rejection arrives in, and the one worth showing the
+        // student verbatim.
+        let body = json!({ "detail": "No face detected in 'card_image'." });
+        assert_eq!(
+            face_verify_message(&body).as_deref(),
+            Some("No face detected in 'card_image'.")
+        );
+    }
+
+    #[test]
+    fn face_verify_message_joins_a_validation_detail_list() {
+        let body = json!({
+            "detail": [
+                { "type": "missing", "loc": ["body", "selfie_image"], "msg": "Field required" },
+                { "type": "missing", "loc": ["body", "card_image"], "msg": "Field required" }
+            ]
+        });
+        assert_eq!(
+            face_verify_message(&body).as_deref(),
+            Some("Field required; Field required")
+        );
+    }
+
+    #[test]
+    fn face_verify_message_falls_back_to_the_verdict_prose() {
+        let body = json!({ "match": false, "message": "NO MATCH — different people" });
+        assert_eq!(
+            face_verify_message(&body).as_deref(),
+            Some("NO MATCH — different people")
+        );
+    }
+
+    #[test]
+    fn face_verify_message_is_none_when_there_is_nothing_to_say() {
+        assert_eq!(face_verify_message(&json!({ "match": true })), None);
+        assert_eq!(face_verify_message(&json!({ "detail": "   " })), None);
+        assert_eq!(face_verify_message(&json!({ "detail": [] })), None);
     }
 
     #[test]

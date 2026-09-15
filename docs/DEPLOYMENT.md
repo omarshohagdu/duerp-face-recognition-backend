@@ -137,6 +137,30 @@ interchangeable:
 
 The first two moved out of duerp-api on 2026-08-19; `WOW_LOG_DIR` did not.
 
+### The face-match service (NFC saves depend on it)
+
+`POST /ext-api/nfc-card/save_card_info` sends the card photo and the selfie to
+a face-match service and writes the row only when it answers `match: true`:
+
+| Key | Points at | Why there |
+|---|---|---|
+| `NFC_FACE_VERIFY_URL` | e.g. `http://10.224.224.101:8089/verify` | The match endpoint. **Leave it unset and every card save is rejected** with a 503 — the gate fails closed on purpose. |
+| `NFC_FACE_VERIFY_API_KEY` | *(the service's key)* | Sent as `X-API-Key`. A wrong key is a 503, not a 400: it is this service's credential, not the student's photo. |
+| `NFC_FACE_VERIFY_TIMEOUT_SECS` | 30 | Bounds a save. Keep it **below** the proxy's read timeout, or the caller gets the proxy's error instead of ours. |
+
+Two operational consequences:
+
+- **This host must be able to reach that service.** It is an outbound call from
+  the app server, not from the reader, so a firewall rule that only covers the
+  readers' subnet is not enough.
+- **If it goes down, card registration stops.** That is the designed behaviour
+  — an unchecked card mapping is what the gate prevents — so treat the service
+  as a dependency of card registration, not as an optional extra. The
+  give-up-and-save switch does not exist; the fix is to bring it back up.
+
+See [`nfc_card.md`](nfc_card.md#the-face-match-gate) for the request shape and
+the error codes.
+
 ### Endpoints that used to be admin-gated
 
 These five required a shared `X-Admin-Key` matching `WOW_ADMIN_KEY`. **That key
