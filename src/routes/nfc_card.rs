@@ -2,6 +2,7 @@
 //!
 //!   GET|POST /ext-api/nfc-card/get_card_info?card_number=...  (or in the body)
 //!   POST /ext-api/nfc-card/save_card_info   (multipart/form-data)
+//!   GET|POST /ext-api/nfc-card/checking_card_reg_status?registration_no=...
 //!
 //! Requirement: `docs/nfc-card-reader-api-spec.md`. API reference:
 //! `docs/nfc_card.md`. Schema and business rules: `sql/004_nfc_card.sql`.
@@ -30,11 +31,16 @@
 //! those rows tight.
 //!
 //! THE RESPONSE ENVELOPE
-//! Both endpoints answer with `status` ("success" | "error") plus a `message`,
-//! and this module is the ONLY place in the service that does — everything
-//! under `/ext-api/wow-attendance/*` still answers with a `success` boolean.
-//! That is a deliberate, requested divergence for the NFC contract, not drift;
-//! a client cannot share a response parser across the two modules.
+//! All three endpoints answer with `status` ("success" | "error") plus a
+//! `message`, and this module is the ONLY place in the service that does —
+//! everything under `/ext-api/wow-attendance/*` still answers with a `success`
+//! boolean. That is a deliberate, requested divergence for the NFC contract,
+//! not drift; a client cannot share a response parser across the two modules.
+//!
+//! `data` is where the three part company: `checking_card_reg_status` carries
+//! it on every response (`{}` when there is nothing to report), the other two
+//! only on success. Also requested, and not something to harmonise — each
+//! endpoint's existing callers are written against its own shape.
 //!
 //! The envelope is built in SQL, not here, so a direct `psql` caller sees the
 //! same shape the HTTP client does. This module only maps the `code` onto a
@@ -145,6 +151,23 @@ fn fail(code: &str, message: impl Into<String>) -> Value {
         "code":    code,
         "message": message.into(),
     })
+}
+
+/// The same failure, for the endpoint whose contract promises `data` on every
+/// response.
+///
+/// `checking_card_reg_status` always carries a `data` object — `{}` when there
+/// is nothing to report — so a client can read it without branching on
+/// `status` first. The SQL function does this for the failures it owns; this
+/// covers the ones raised before it is ever reached. `get_card_info` keeps
+/// using plain `fail`: it omits `data` on failure and its callers are written
+/// against that.
+fn fail_with_empty_data(code: &str, message: impl Into<String>) -> Value {
+    let mut out = fail(code, message);
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("data".to_string(), json!({}));
+    }
+    out
 }
 
 /// Did the SQL layer report success?
@@ -452,17 +475,22 @@ pub struct GetCardInfoQuery {
     pub card_number: Option<String>,
 }
 
-/// Pull `card_number` out of a POST body, whichever way the client encoded it.
+/// Pull one named scalar out of a POST body, whichever way the client encoded
+/// it.
 ///
 /// A lookup carrying one scalar can arrive four different ways in practice, and
 /// a client that guessed differently from us should not get a 400 that reads
-/// like the card is unknown. Handled here rather than by an extractor because
+/// like the value is unknown. Handled here rather than by an extractor because
 /// `web::Json` / `Multipart` each commit to ONE encoding and fail the request
 /// outright on the others.
 ///
+/// `field` is the parameter to look for — `card_number` for the scan lookup,
+/// `registration_no` for the registration-status check. One parser for both, so
+/// the two cannot drift into accepting different encodings.
+///
 /// Returns `None` for a GET (no body), an empty body, or a body with no such
 /// field — the caller then falls back to the query string.
-fn card_number_from_body(content_type: &str, body: &[u8]) -> Option<String> {
+fn scalar_from_body(content_type: &str, body: &[u8], field: &str) -> Option<String> {
     if body.is_empty() {
         return None;
     }
@@ -470,27 +498,19 @@ fn card_number_from_body(content_type: &str, body: &[u8]) -> Option<String> {
 
     // multipart/form-data — what Postman sends by default for a POST.
     if ct.starts_with("multipart/") {
-        return multipart_text_field(body, "card_number");
+        return multipart_text_field(body, field);
     }
 
     // application/json
     if ct.contains("json") {
-        return serde_json::from_slice::<Value>(body)
-            .ok()?
-            .get("card_number")
-            .and_then(|v| match v {
-                // A numeric UID sent unquoted is still a card number.
-                Value::String(s) => Some(s.clone()),
-                Value::Number(n) => Some(n.to_string()),
-                _ => None,
-            });
+        return json_scalar(body, field);
     }
 
     // application/x-www-form-urlencoded
     if ct.contains("x-www-form-urlencoded") {
         let text = String::from_utf8_lossy(body);
         return query_to_json(&text)
-            .get("card_number")
+            .get(field)
             .and_then(Value::as_str)
             .map(str::to_string)
             .filter(|s| !s.trim().is_empty());
@@ -499,20 +519,43 @@ fn card_number_from_body(content_type: &str, body: &[u8]) -> Option<String> {
     // No usable Content-Type. Rather than give up, try the two encodings a body
     // can be identified from its own bytes — a client that sent no header at
     // all is common enough to be worth rescuing.
+    json_scalar(body, field).or_else(|| {
+        query_to_json(&String::from_utf8_lossy(body))
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty())
+    })
+}
+
+/// One scalar out of a JSON body, quoted or not.
+///
+/// A bare number is accepted because that is how both of these values are
+/// routinely sent — `{"card_number":41234}` for a numeric UID, and
+/// `{"registration_no":2017001010}`, which is the requested form of the
+/// registration-status request. Rejecting them would fail a request over two
+/// quotation marks.
+fn json_scalar(body: &[u8], field: &str) -> Option<String> {
     serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|v| {
-            v.get("card_number")
-                .and_then(Value::as_str)
-                .map(str::to_string)
+        .ok()?
+        .get(field)
+        .and_then(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
         })
-        .or_else(|| {
-            query_to_json(&String::from_utf8_lossy(body))
-                .get("card_number")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .filter(|s| !s.trim().is_empty())
-        })
+}
+
+/// The scan lookup's parameter. Named wrappers rather than a bare string at the
+/// call site, so a typo'd field name is a compile error rather than a request
+/// that silently never finds its value.
+fn card_number_from_body(content_type: &str, body: &[u8]) -> Option<String> {
+    scalar_from_body(content_type, body, "card_number")
+}
+
+/// The registration-status check's parameter.
+fn registration_no_from_body(content_type: &str, body: &[u8]) -> Option<String> {
+    scalar_from_body(content_type, body, "registration_no")
 }
 
 /// Read one simple text field out of a `multipart/form-data` body.
@@ -1112,6 +1155,194 @@ async fn nfc_save_card_info_inner(
 }
 
 // ---------------------------------------------------------------------
+// 3 · checking_card_reg_status — does this student already hold a card?
+//
+// The desk-side question, asked before a card is issued, and asked about the
+// STUDENT: `registration_no`, matched against the `student_applicant_id` the
+// save upserts on. `get_card_info` answers the card-side question — who does
+// this UID belong to — on every tap and stays deliberately lean; this one
+// answers with the whole registration, images, timestamps and an
+// `is_registered` flag, because the caller is deciding what to do next rather
+// than admitting someone through a door.
+//
+// TWO CONTRACT DIFFERENCES, both requested, neither shared with the endpoints
+// above:
+//   * `data` is present on EVERY response, `{}` when there is no
+//     registration. The other two omit it on failure and must keep doing so —
+//     their callers are written against that.
+//   * The payload carries the card image, the selfie and the timestamps. Same
+//     auth gate as `save_card_info`, which already returns those URLs, but it
+//     is more than a tap needs to know, which is exactly why `get_card_info`
+//     does not return it.
+//
+// The input is NOT put through `nfc_card_normalize`: that is the card-UID
+// rule (separators stripped, upper-cased), and applying it to an applicant id
+// would let this endpoint match a student the save would treat as someone
+// else. Trimmed and compared as stored — see `sql/004_nfc_card.sql` §4b.
+// ---------------------------------------------------------------------
+
+/// `registration_no` also accepted as a query parameter.
+///
+/// Optional so extraction never fails; a missing value is reported as a 400
+/// naming the parameter, which beats actix's own "missing field" text for
+/// somebody debugging a desk client.
+#[derive(Deserialize)]
+pub struct RegStatusQuery {
+    pub registration_no: Option<String>,
+}
+
+// GET and POST for the same reason `get_card_info` takes both: this service is
+// POST throughout, including its read-only endpoints, and a client posting to
+// all of them should not special-case one path — while a status check changes
+// nothing, so GET is honest. One `ext_api_allowed_ips` row covers both methods;
+// the allow-list matches on path.
+#[route("/nfc-card/checking_card_reg_status", method = "GET", method = "POST")]
+pub async fn nfc_checking_card_reg_status(
+    req: actix_web::HttpRequest,
+    db: web::Data<PgPool>,
+    query: web::Query<RegStatusQuery>,
+    body: web::Bytes,
+) -> HttpResponse {
+    let log = StepLogger::new("ext-api/nfc-card/checking_card_reg_status");
+    log.set_base_url(&public_base_url(&req));
+    log.set_endpoint(req.method().as_str(), &full_path(&req));
+    log.params("query", &query_to_json(req.query_string()));
+    let resp = nfc_checking_card_reg_status_inner(&log, req, db, query, body).await;
+    log_local_response(&log, resp).await
+}
+
+async fn nfc_checking_card_reg_status_inner(
+    log: &StepLogger,
+    req: actix_web::HttpRequest,
+    db: web::Data<PgPool>,
+    query: web::Query<RegStatusQuery>,
+    body: web::Bytes,
+) -> HttpResponse {
+    let client_ip = req
+        .connection_info()
+        .realip_remote_addr()
+        .unwrap_or("")
+        .to_string();
+    log.step(format!("request received (client_ip={client_ip})"));
+
+    let (token_user_id, token_line) = match require_token_caller(&req) {
+        Ok(v) => v,
+        Err(resp) => {
+            log.step("token validation FAILED — rejecting request");
+            return resp;
+        }
+    };
+    log.step(token_line);
+
+    // Query string first, then the body — same precedence and the same four
+    // encodings `get_card_info` accepts, so a client that already talks to that
+    // endpoint needs no second way of sending one scalar. A JSON body may send
+    // the number unquoted, which is the requested form:
+    // `{"registration_no": 2017001010}`.
+    let from_query = query
+        .registration_no
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let content_type = req
+        .headers()
+        .get(actix_web::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let registration_no = match from_query {
+        Some(r) => r,
+        None => match registration_no_from_body(content_type, &body) {
+            Some(r) => {
+                // Record where it came from: a client whose query string is
+                // being stripped in transit looks identical to one that never
+                // sent it, and this line is what separates them.
+                log.params(
+                    "body",
+                    &json!({ "registration_no": r.trim(), "content_type": content_type }),
+                );
+                r.trim().to_string()
+            }
+            None => {
+                log.step(format!(
+                    "`registration_no` missing from query and body (method={}, content_type={}, body_bytes={}) — returning 400",
+                    req.method(),
+                    if content_type.is_empty() { "<none>" } else { content_type },
+                    body.len()
+                ));
+                return HttpResponse::BadRequest().json(fail_with_empty_data(
+                    "missing_registration_no",
+                    "registration_no is required",
+                ));
+            }
+        },
+    };
+    let registration_no = registration_no.as_str();
+    // Filed per student, like `save_card_info` — the two calls a desk makes
+    // about one registration land next to each other in the log folder.
+    log.set_id(registration_no);
+
+    log.step(format!(
+        "checking registration via attendance.nfc_card_reg_status (lookup by token user id={token_user_id})"
+    ));
+    let result = sqlx::query_scalar::<_, Value>("SELECT attendance.nfc_card_reg_status($1)")
+        .bind(registration_no)
+        .fetch_one(db.get_ref())
+        .await;
+
+    match result {
+        Ok(mut body) => {
+            if !is_ok(&body) {
+                let code = body
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let status = status_for_code(&code);
+                log.step(format!(
+                    "no registration / rejected (code={code}) — returning {}",
+                    status.as_u16()
+                ));
+                return HttpResponse::build(status).json(body);
+            }
+
+            // Rows hold filesystem paths; the response owes the caller URLs.
+            // Same swap `save_card_info` does, for the same two keys.
+            let base = public_base_url(&req);
+            if let Some(data) = body.get_mut("data").and_then(Value::as_object_mut) {
+                for key in ["card_image", "student_selfie"] {
+                    let stored = data.get(key).and_then(Value::as_str).map(str::to_string);
+                    let url = public_image_url(&base, stored.as_deref());
+                    // No image on file, or one stored outside the served tree:
+                    // null rather than a link that 404s.
+                    data.insert(
+                        key.to_string(),
+                        url.map(Value::String).unwrap_or(Value::Null),
+                    );
+                }
+            }
+
+            log.step("student holds a registered card — returning 200");
+            HttpResponse::Ok().json(body)
+        }
+        Err(err) => {
+            eprintln!("DB error in nfc_checking_card_reg_status: {err}");
+            log.step(format!("DB registration-status lookup FAILED: {err}"));
+            // A missing `attendance.nfc_card_reg_status`, or one still carrying
+            // the old `p_card_number` parameter, lands here — the SQL and the
+            // binary ship together, so an unapplied migration reads as a 500 on
+            // every call rather than as an unregistered student.
+            HttpResponse::InternalServerError().json(fail_with_empty_data(
+                "internal_error",
+                "Internal server error",
+            ))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Tests
 //
 // The filename sanitiser and the two form-value parsers are the parts of this
@@ -1298,6 +1529,25 @@ mod tests {
     }
 
     #[test]
+    fn fail_with_empty_data_always_carries_a_data_object() {
+        // The reg-status contract: `data` is present whatever happened, so a
+        // client can read it without branching on `status` first.
+        let out = fail_with_empty_data("missing_card_number", "card_number is required");
+        assert_eq!(out["status"], "error");
+        assert_eq!(out["code"], "missing_card_number");
+        assert_eq!(out["data"], json!({}));
+        assert!(out["data"].is_object());
+    }
+
+    #[test]
+    fn fail_leaves_data_off_for_the_other_two_endpoints() {
+        // `get_card_info` and `save_card_info` omit `data` on failure, and
+        // their callers are written against that — the two helpers must not
+        // converge.
+        assert!(fail("card_not_found", "No Data Found").get("data").is_none());
+    }
+
+    #[test]
     fn is_ok_reads_the_status_string() {
         assert!(is_ok(&json!({ "status": "success", "message": "Data Found" })));
         assert!(!is_ok(&json!({ "status": "error", "code": "card_not_found" })));
@@ -1460,6 +1710,74 @@ AABBCCDD\r\n\
         );
         // Malformed JSON must not panic.
         assert_eq!(card_number_from_body("application/json", b"{not json"), None);
+    }
+
+    // ---- registration_no_from_body --------------------------------------
+    //
+    // The registration-status check reads a different field out of the same
+    // four encodings. Its requested body is `{"registration_no": 2017001010}`
+    // — an unquoted number — so that form is the one that must not regress.
+
+    const REG_NO: &str = "2017001010";
+
+    #[test]
+    fn registration_body_reads_the_unquoted_number_from_the_spec() {
+        assert_eq!(
+            registration_no_from_body("application/json", br#"{"registration_no":2017001010}"#),
+            Some(REG_NO.to_string())
+        );
+        // Quoted works too — some clients send every scalar as a string.
+        assert_eq!(
+            registration_no_from_body("application/json", br#"{"registration_no":"2017001010"}"#),
+            Some(REG_NO.to_string())
+        );
+    }
+
+    #[test]
+    fn registration_body_reads_the_other_three_encodings() {
+        assert_eq!(
+            registration_no_from_body(
+                "application/x-www-form-urlencoded",
+                b"registration_no=2017001010"
+            ),
+            Some(REG_NO.to_string())
+        );
+
+        let multipart = b"------WebKitFormBoundaryABC\r\n\
+Content-Disposition: form-data; name=\"registration_no\"\r\n\
+\r\n\
+2017001010\r\n\
+------WebKitFormBoundaryABC--\r\n";
+        assert_eq!(
+            registration_no_from_body("multipart/form-data; boundary=X", multipart),
+            Some(REG_NO.to_string())
+        );
+
+        // No Content-Type at all — embedded stacks routinely omit it, and the
+        // value is still a bare number.
+        assert_eq!(
+            registration_no_from_body("", br#"{"registration_no":2017001010}"#),
+            Some(REG_NO.to_string())
+        );
+        assert_eq!(
+            registration_no_from_body("", b"registration_no=2017001010"),
+            Some(REG_NO.to_string())
+        );
+    }
+
+    #[test]
+    fn the_two_endpoints_do_not_read_each_others_fields() {
+        // A desk that sends `card_number` to the registration-status check has
+        // asked the wrong question, and must get the 400 that names the
+        // parameter rather than a silent lookup on the wrong column.
+        assert_eq!(
+            registration_no_from_body("application/json", br#"{"card_number":"04A1B2C3D4E5"}"#),
+            None
+        );
+        assert_eq!(
+            card_number_from_body("application/json", br#"{"registration_no":2017001010}"#),
+            None
+        );
     }
 
     #[test]

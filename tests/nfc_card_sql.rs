@@ -38,13 +38,14 @@ async fn pool() -> Option<PgPool> {
 /// naming the file, instead of failing every test with an opaque "function
 /// does not exist" from Postgres.
 async fn functions_present(pool: &PgPool) -> bool {
+    // Every function this file exercises, not just one: a database carrying an
+    // earlier version of the migration would otherwise pass this check and
+    // then fail the newer tests with an opaque "function does not exist".
     sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (
-             SELECT 1 FROM pg_proc p
-               JOIN pg_namespace n ON n.oid = p.pronamespace
-              WHERE n.nspname = 'attendance'
-                AND p.proname = 'nfc_card_save_info'
-         )",
+        "SELECT count(*) = 2 FROM pg_proc p
+           JOIN pg_namespace n ON n.oid = p.pronamespace
+          WHERE n.nspname = 'attendance'
+            AND p.proname IN ('nfc_card_save_info', 'nfc_card_reg_status')",
     )
     .fetch_one(pool)
     .await
@@ -129,6 +130,16 @@ async fn get_info(tx: &mut Transaction<'_, Postgres>, card: Option<&str>) -> Val
         .fetch_one(&mut **tx)
         .await
         .expect("card get call failed")
+}
+
+/// Call the registration-status function the way its handler does: keyed on
+/// the student's registration number, not on a card.
+async fn reg_status(tx: &mut Transaction<'_, Postgres>, registration_no: Option<&str>) -> Value {
+    sqlx::query_scalar::<_, Value>("SELECT attendance.nfc_card_reg_status($1)")
+        .bind(registration_no)
+        .fetch_one(&mut **tx)
+        .await
+        .expect("card reg-status call failed")
 }
 
 async fn normalize(tx: &mut Transaction<'_, Postgres>, raw: Option<&str>) -> Option<String> {
@@ -486,6 +497,201 @@ async fn lookup_distinguishes_missing_input_from_unknown_card() {
     let unknown = get_info(&mut tx, Some(&format!("NOSUCH{}", unique()))).await;
     assert!(!ok(&unknown));
     assert_eq!(code(&unknown), "card_not_found");
+}
+
+// ---------------------------------------------------------------------
+// checking_card_reg_status — "does this student already hold a card?"
+//
+// Keyed on the registration number (`student_applicant_id`), not on the card,
+// and with a deliberately different payload from get_info: `data` on every
+// response, and the whole row rather than the four lean fields. These pin that
+// difference, because the two are one `CREATE OR REPLACE` away from being
+// quietly harmonised into each other.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn reg_status_returns_the_whole_registration() {
+    let pool = db_or_skip!();
+    let mut tx = pool.begin().await.expect("begin");
+    let (applicant, card) = fixture_ids();
+
+    save(
+        &mut tx,
+        &applicant,
+        Some(&card),
+        Some(1),
+        Some(1),
+        Some("/app/uploads/nfc_card/cards/a.jpg"),
+        Some("/app/uploads/nfc_card/selfies/a.jpg"),
+        false,
+    )
+    .await;
+
+    let r = reg_status(&mut tx, Some(&applicant)).await;
+    assert!(ok(&r), "a registered student should be found: {r}");
+    assert_eq!(data(&r, "is_registered"), true);
+    assert_eq!(data(&r, "student_applicant_id"), applicant.as_str());
+    // The caller asked with `registration_no`, so it is echoed under that name
+    // too — one column, two names, neither of which a client must translate.
+    assert_eq!(data(&r, "registration_no"), applicant.as_str());
+    assert_eq!(data(&r, "card_number"), card.as_str());
+    assert_eq!(data(&r, "is_verified_label"), "Verified");
+    assert_eq!(data(&r, "registration_type_label"), "Admin");
+
+    // The images and timestamps get_info deliberately withholds. The handler
+    // swaps the two paths for public URLs; SQL callers see the stored paths.
+    assert_eq!(data(&r, "card_image"), "/app/uploads/nfc_card/cards/a.jpg");
+    assert_eq!(
+        data(&r, "student_selfie"),
+        "/app/uploads/nfc_card/selfies/a.jpg"
+    );
+    assert!(
+        data(&r, "registered_at").is_string(),
+        "registered_at should be a timestamp: {r}"
+    );
+    assert!(data(&r, "updated_at").is_string(), "no updated_at: {r}");
+}
+
+#[tokio::test]
+async fn reg_status_carries_a_data_object_on_every_answer() {
+    let pool = db_or_skip!();
+    let mut tx = pool.begin().await.expect("begin");
+    let (applicant, card) = fixture_ids();
+    save_admin(&mut tx, &applicant, &card).await;
+
+    // The whole point of this endpoint's envelope: a client may read `data`
+    // without first branching on `status`. An omitted `data` — which is what
+    // get_info does on failure — would be a null dereference there.
+    for (label, v) in [
+        ("registered", reg_status(&mut tx, Some(&applicant)).await),
+        ("unregistered", reg_status(&mut tx, Some("NOSUCHSTUDENT")).await),
+        ("missing input", reg_status(&mut tx, None).await),
+    ] {
+        assert!(
+            v.get("data").map(Value::is_object).unwrap_or(false),
+            "{label}: data must be an object, got {v}"
+        );
+    }
+
+    // And it is EMPTY when there is nothing to report — not a row with nulls.
+    assert_eq!(
+        reg_status(&mut tx, Some("NOSUCHSTUDENT")).await["data"],
+        serde_json::json!({})
+    );
+    assert_eq!(reg_status(&mut tx, None).await["data"], serde_json::json!({}));
+}
+
+#[tokio::test]
+async fn reg_status_messages_are_the_agreed_strings() {
+    let pool = db_or_skip!();
+    let mut tx = pool.begin().await.expect("begin");
+    let (applicant, card) = fixture_ids();
+    save_admin(&mut tx, &applicant, &card).await;
+
+    // The success message names the student the answer is about.
+    let found = reg_status(&mut tx, Some(&applicant)).await;
+    assert!(
+        message(&found).contains(&applicant),
+        "message should name the registration no: {}",
+        message(&found)
+    );
+
+    // "No Data Found" is the contract string for the not-registered case; a
+    // reword is a client change.
+    assert_eq!(
+        message(&reg_status(&mut tx, Some("NOSUCHSTUDENT")).await),
+        "No Data Found"
+    );
+}
+
+#[tokio::test]
+async fn reg_status_distinguishes_missing_input_from_an_unregistered_student() {
+    let pool = db_or_skip!();
+    let mut tx = pool.begin().await.expect("begin");
+
+    // The handler maps these to 400 and 404, so they must not collapse into one
+    // code. Note `--` is NOT a missing value here, unlike on the card lookup:
+    // an applicant id is not normalised, so it is simply a student nobody has
+    // heard of.
+    for empty in [None, Some(""), Some("   ")] {
+        let r = reg_status(&mut tx, empty).await;
+        assert!(!ok(&r));
+        assert_eq!(code(&r), "missing_registration_no", "for input {empty:?}");
+    }
+
+    let unknown = reg_status(&mut tx, Some(&format!("NOSUCH{}", unique()))).await;
+    assert!(!ok(&unknown));
+    assert_eq!(code(&unknown), "card_not_found");
+}
+
+#[tokio::test]
+async fn reg_status_trims_but_does_not_otherwise_rewrite_the_registration_no() {
+    let pool = db_or_skip!();
+    let mut tx = pool.begin().await.expect("begin");
+    let (applicant, card) = fixture_ids();
+    save_admin(&mut tx, &applicant, &card).await;
+
+    // Whitespace is stripped — the save stores a btrim'd value, so a padded
+    // lookup has to find it.
+    assert!(ok(&reg_status(&mut tx, Some(&format!("  {applicant}  "))).await));
+
+    // But nothing else is. The card-UID rules (case-folding, separators
+    // stripped) must NOT leak onto this key: matching more loosely than the
+    // save does would report one student's card under another's id.
+    for altered in [
+        applicant.to_lowercase(),
+        applicant.replace('-', ""),
+        format!("{applicant}X"),
+    ] {
+        let r = reg_status(&mut tx, Some(&altered)).await;
+        assert!(!ok(&r), "{altered} must not match {applicant}: {r}");
+        assert_eq!(code(&r), "card_not_found");
+    }
+}
+
+#[tokio::test]
+async fn reg_status_counts_an_unverified_mapping_as_registered() {
+    let pool = db_or_skip!();
+    let mut tx = pool.begin().await.expect("begin");
+    let (applicant, card) = fixture_ids();
+
+    // "Registered" and "verified" are different questions. A card awaiting
+    // review is still taken, and a desk that read this as "not registered"
+    // would issue a second card to the same student.
+    save(&mut tx, &applicant, Some(&card), Some(2), Some(2), None, None, false).await;
+
+    let r = reg_status(&mut tx, Some(&applicant)).await;
+    assert!(ok(&r), "unverified registration is still a registration: {r}");
+    assert_eq!(data(&r, "is_registered"), true);
+    assert_eq!(data(&r, "is_verified"), 2);
+    assert_eq!(data(&r, "is_verified_label"), "Not Verified");
+}
+
+#[tokio::test]
+async fn a_student_whose_card_was_reissued_is_no_longer_registered() {
+    let pool = db_or_skip!();
+    let mut tx = pool.begin().await.expect("begin");
+    let (first, card) = fixture_ids();
+    let (second, _) = fixture_ids();
+
+    save_admin(&mut tx, &first, &card).await;
+    assert!(ok(&reg_status(&mut tx, Some(&first)).await));
+
+    // The card moves to another student. The first student's RECORD survives,
+    // images and all, with a NULL card number — but they hold no card, so the
+    // answer to "is their card registered?" flips to no. Reporting them as
+    // registered would stop the desk issuing them a replacement.
+    save(&mut tx, &second, Some(&card), Some(1), Some(1), None, None, true).await;
+
+    let old_holder = reg_status(&mut tx, Some(&first)).await;
+    assert!(!ok(&old_holder), "card was taken away: {old_holder}");
+    assert_eq!(code(&old_holder), "card_not_found");
+    assert_eq!(old_holder["data"], serde_json::json!({}));
+
+    // ...and the new holder is the one who now has it.
+    let new_holder = reg_status(&mut tx, Some(&second)).await;
+    assert!(ok(&new_holder));
+    assert_eq!(data(&new_holder, "card_number"), card.as_str());
 }
 
 // ---------------------------------------------------------------------

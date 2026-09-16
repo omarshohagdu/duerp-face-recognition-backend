@@ -979,10 +979,10 @@ CREATE INDEX IF NOT EXISTS wow_attendance_token_mismatch_created_idx
 -- ---------------------------------------------------------------------
 -- 5 · NFC card <-> student mapping
 --
--- Generated from sql/004_nfc_card.sql. Backs the two `/ext-api/nfc-card/*`
+-- Generated from sql/004_nfc_card.sql. Backs the three `/ext-api/nfc-card/*`
 -- endpoints in src/routes/nfc_card.rs; see docs/nfc_card.md.
 --
--- These two functions answer with `status` ("success" | "error") plus a
+-- These functions answer with `status` ("success" | "error") plus a
 -- `message`, NOT the `success` boolean every wow_attendance function returns.
 -- That is the NFC contract, requested deliberately; do not "harmonise" it.
 --
@@ -992,7 +992,7 @@ CREATE INDEX IF NOT EXISTS wow_attendance_token_mismatch_created_idx
 --
 -- NOT copied from the migration: its `attendance.ext_api_allowed_ips` seed. That
 -- table is created by sql/000_ext_api_infra.sql rather than by this file, even
--- though it now lives in this schema — but the two endpoints still need their
+-- though it now lives in this schema — but all three endpoints still need their
 -- rows in it or every call is a 403 before the handler runs. Apply sql/000 as
 -- well, or insert them by hand.
 -- ---------------------------------------------------------------------
@@ -1197,7 +1197,129 @@ END;
 $function$;
 
 -- ---------------------------------------------------------------------
--- 5f · Function: save / update a card record
+-- 5f · Function: registration-status check
+--
+-- "Has this student's card already been registered?" — the desk-side question,
+-- asked before a card is issued, and asked about the STUDENT, not the card.
+-- The card-side question ("who does this UID belong to?") is what
+-- `nfc_card_get_info` answers on every tap.
+--
+-- WHAT `p_registration_no` IS MATCHED AGAINST
+-- `nfc_student_cards.student_applicant_id` — the same key `nfc_card_save_info`
+-- upserts on, whatever the card desk put there. It is an opaque external
+-- identifier with no foreign key (see the header of this file), so this
+-- function cannot and does not validate it against a student registry: an
+-- unknown number and a typo'd one are the same answer, "no registration".
+-- Nothing is joined to `ictcell.lms_student` either — that table carries no
+-- applicant identifier, so there is no link to follow.
+--
+-- Compared as `btrim(...)`, exactly what the save stores, and NOT through
+-- `nfc_card_normalize`: that function is for card UIDs, which are matched
+-- case- and separator-insensitively. Applying it here would let this endpoint
+-- report a registration under a spelling the save would treat as a different
+-- student. A lookup must never be looser than the write it reports on.
+--
+-- Same lookup as the other two, DELIBERATELY DIFFERENT PAYLOAD, and that
+-- difference is why this is a third function rather than a flag on one of
+-- them:
+--
+--   * `data` is ALWAYS an object — `{}` when there is no registration. The
+--     requested contract for this endpoint says so, so a client can read
+--     `data` without first checking `status`. `nfc_card_get_info` omits `data`
+--     on failure and must keep doing so; its callers are already written
+--     against that.
+--   * The row is returned WHOLE — images and timestamps included — because
+--     the caller is a registration desk deciding what to do next, not a
+--     turnstile that must not carry PII it has no use for. The handler swaps
+--     the stored paths for public URLs before answering; a direct SQL caller
+--     sees the paths, exactly as with `nfc_card_save_info`.
+--
+-- `is_registered` is `true` whenever a row comes back. It is redundant with
+-- `status` by construction and exists so a UI can bind one boolean rather
+-- than branch on a string. There is no `is_registered: false` case: a student
+-- with no registration has no data object to put it in.
+-- ---------------------------------------------------------------------
+
+-- The parameter was `p_card_number` in the first version of this endpoint, and
+-- Postgres refuses to rename an input parameter through CREATE OR REPLACE
+-- ("cannot change name of input parameter"). Dropping first is what makes a
+-- re-run of this file work on a database that already has that version.
+-- Harmless on a database that does not, and the function has no dependents —
+-- nothing calls it but the handler.
+DROP FUNCTION IF EXISTS attendance.nfc_card_reg_status(varchar);
+
+CREATE OR REPLACE FUNCTION attendance.nfc_card_reg_status(p_registration_no varchar)
+RETURNS jsonb
+LANGUAGE plpgsql STABLE
+AS $function$
+DECLARE
+    v_reg_no varchar := nullif(btrim(coalesce(p_registration_no, '')), '');
+    v_row    RECORD;
+BEGIN
+    IF v_reg_no IS NULL THEN
+        RETURN jsonb_build_object(
+            'status',  'error',
+            'code',    'missing_registration_no',
+            'message', 'registration_no is required',
+            'data',    '{}'::jsonb);
+    END IF;
+
+    -- `card_number IS NOT NULL` is part of the question, not a detail: a
+    -- student whose card was re-issued to someone else keeps their record —
+    -- images and all — with a NULL card number. They hold no card, so "is
+    -- their card registered?" is NO, and a desk told otherwise would refuse to
+    -- issue them one.
+    SELECT c.student_applicant_id, c.card_number, c.is_verified,
+           c.registration_type, c.card_image, c.student_selfie,
+           c.created_at, c.updated_at
+      INTO v_row
+      FROM attendance.nfc_student_cards c
+     WHERE c.student_applicant_id = v_reg_no
+       AND c.card_number IS NOT NULL;
+
+    -- Not an error in the domain sense — "not registered" is a perfectly good
+    -- answer to this question — but it is reported as one, because the agreed
+    -- contract pairs `status: "error"` with `data: {}` here. Match on `code`.
+    IF NOT FOUND THEN
+        RETURN jsonb_build_object(
+            'status',  'error',
+            'code',    'card_not_found',
+            'message', 'No Data Found',
+            'data',    '{}'::jsonb);
+    END IF;
+
+    RETURN jsonb_build_object(
+        'status',  'success',
+        'message', 'Registration found for registration no ' || v_row.student_applicant_id,
+        'data', jsonb_build_object(
+            'is_registered',        true,
+            'student_applicant_id', v_row.student_applicant_id,
+            -- Echoed under both names: `registration_no` is what the caller
+            -- asked with, `student_applicant_id` is what the other two
+            -- endpoints call the same value, and a client should not have to
+            -- know they are one column.
+            'registration_no',      v_row.student_applicant_id,
+            'card_number',          v_row.card_number,
+            'is_verified',          v_row.is_verified,
+            'registration_type',    v_row.registration_type,
+            -- Stored filesystem paths; the handler replaces both with public
+            -- URLs before answering.
+            'card_image',           v_row.card_image,
+            'student_selfie',       v_row.student_selfie,
+            -- When the registration was first created, and when it last
+            -- changed — what "already registered" is usually asked alongside.
+            'registered_at',        v_row.created_at,
+            'updated_at',           v_row.updated_at
+        ) || attendance.nfc_card_labels(v_row.is_verified, v_row.registration_type)
+    );
+END;
+$function$;
+
+COMMENT ON FUNCTION attendance.nfc_card_reg_status(varchar) IS
+    'Does this registration no hold a registered card? Matched on student_applicant_id; whole row + is_registered on success; data is always an object, {} when not.';
+
+-- ---------------------------------------------------------------------
+-- 5g · Function: save / update a card record
 --
 -- Upserts on `student_applicant_id` — one card record per student, so a
 -- repeated save is an update, not a second row.

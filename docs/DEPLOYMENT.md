@@ -100,9 +100,11 @@ can check in cannot necessarily open the reports — each path needs its own row
 `logs/login` and `logs/attendance`.
 
 The NFC card reader is a separate client on separate paths, and it has its own
-two rows — `/ext-api/nfc-card/get_card_info` and `/ext-api/nfc-card/save_card_info`
-— **both open to every IP**. They hold the `'*'` wildcard rather than a list of
-addresses, because the readers are on campus DHCP. That leaves the app
+three rows — `/ext-api/nfc-card/get_card_info`,
+`/ext-api/nfc-card/save_card_info` and
+`/ext-api/nfc-card/checking_card_reg_status` — **all open to every IP**. They
+hold the `'*'` wildcard rather than a list of addresses, because the readers are
+on campus DHCP. That leaves the app
 credentials and a bearer token as the only gate on them, and any token holder
 who can reach the service can reassign a card. See
 [`nfc_card.md`](nfc_card.md#auth).

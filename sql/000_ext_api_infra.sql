@@ -20,7 +20,7 @@
 --   * ext_api_allowed_ips.ip_address is an ARRAY — the check is
 --     `$2 = ANY(ip_address)`, one row per endpoint holding many IPs.
 --     A literal `'*'` in that array means "any IP" and skips the check for
---     that endpoint; sql/004_nfc_card.sql uses it for the two NFC paths.
+--     that endpoint; sql/004_nfc_card.sql uses it for the three NFC paths.
 --   * status_code is smallint — api_logger binds `status_code as i16`.
 --
 -- Apply first: this file, then 001 -> 002 -> 003 -> 004 -> 005.
@@ -70,7 +70,7 @@ CREATE INDEX IF NOT EXISTS ext_api_call_logs_endpoint_status_idx
 
 -- ── Seed the allow-list for this service's endpoints ─────────────────
 -- Localhost only. Add real client IPs per endpoint before going live (or `'*'`
--- for any IP, as sql/004_nfc_card.sql does for the two NFC paths):
+-- for any IP, as sql/004_nfc_card.sql does for the three NFC paths):
 --   UPDATE attendance.ext_api_allowed_ips
 --      SET ip_address = ip_address || '{203.0.113.10}'
 --    WHERE endpoint = '/ext-api/wow-attendance/verify';
@@ -102,7 +102,8 @@ SELECT v.endpoint, '{127.0.0.1,::1}'::text[]
     -- NFC card <-> student mapping. Gated by the app credentials + this list
     -- plus a bearer token. See docs/nfc_card.md.
     ('/ext-api/nfc-card/get_card_info'),
-    ('/ext-api/nfc-card/save_card_info')
+    ('/ext-api/nfc-card/save_card_info'),
+    ('/ext-api/nfc-card/checking_card_reg_status')
   ) AS v(endpoint)
  WHERE NOT EXISTS (
     SELECT 1 FROM attendance.ext_api_allowed_ips a

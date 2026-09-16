@@ -4,12 +4,17 @@ NFC card ↔ student mapping. A card desk assigns a physical card to a student
 and stores a photo of the card plus a selfie; a reader later taps the card and
 gets back who it belongs to.
 
-Two endpoints:
+Three endpoints:
 
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` (or `GET`) | `/ext-api/nfc-card/get_card_info` | Scan lookup → applicant id, card number, and the two flags with readable labels. Nothing else: it is called on every tap, so the payload stays small and free of PII. |
 | `POST` | `/ext-api/nfc-card/save_card_info` | Create or update a student's card record. Always carries a card photo **and** a selfie, and saves only if a face-match service says they are the same person. |
+| `POST` (or `GET`) | `/ext-api/nfc-card/checking_card_reg_status` | **Does this student already hold a card?** Asked with `registration_no`, not a card number. Returns the whole registration — images, timestamps, `is_registered` — and a `data` object on *every* response. For a desk deciding what to do next, not for a turnstile. |
+
+The first and the third read the same table from opposite ends — one by card,
+one by student; [which to call](#which-lookup-should-i-call) is a one-line
+decision.
 
 Every call needs **three** things: the app credentials, an allow-listed IP, and
 a bearer token. If you are looking at an error right now, jump to
@@ -28,7 +33,7 @@ Tests: `cargo test --bin duerp-attendance` (unit) · `cargo test --test nfc_card
 
 ## Response envelope
 
-Both endpoints answer in one shape:
+All three endpoints answer in one shape:
 
 ```json
 { "status": "success", "message": "…", "data": { … } }
@@ -39,9 +44,16 @@ Both endpoints answer in one shape:
 |---|---|---|
 | `status` | yes | `"success"` or `"error"`. **This is the field to branch on.** |
 | `message` | yes | Human-readable. Prose — may be reworded, so don't match on it. |
-| `data` | success only | Plus `data.assigned_to` on a `card_conflict`, naming the current holder. |
+| `data` | success only — **but always on `checking_card_reg_status`** | Plus `data.assigned_to` on a `card_conflict`, naming the current holder. |
 | `code` | errors only | Stable machine-readable reason. Match on this. |
 | `warnings` | `save_card_info` | Non-fatal notices; see [below](#behaviour-worth-knowing). |
+
+> **One deliberate difference between the three.**
+> `checking_card_reg_status` carries `data` on *every* response — `{}` when
+> there is no registration — so a client can read it without branching on
+> `status` first. The other two omit `data` on failure, and their callers are
+> written against that. Both shapes were requested; neither is drift, and
+> "harmonising" them would break one set of clients.
 
 > **This module is the only one in the service that uses `status`.** Everything
 > under `/ext-api/wow-attendance/*` still answers with a `success` boolean, and
@@ -67,12 +79,12 @@ map the function's error `code` onto a status, and turn stored paths into URLs.
 
 ## Auth
 
-Both endpoints sit under `/ext-api`, so `ExtAuthMiddleware` applies first:
+All three endpoints sit under `/ext-api`, so `ExtAuthMiddleware` applies first:
 
 | Layer | Requirement | Failure |
 |---|---|---|
 | 1 · App credentials | `X-App-Id` + `X-App-Password` matching `EXT_APP_ID` / `EXT_APP_PASSWORD` | `401 Invalid App ID or Password` |
-| 2 · IP allow-list | **Open to every IP.** Both rows carry the `'*'` wildcard, so the check passes for any caller; the row must still exist and be `is_active` | `403 IP address not allowed for this endpoint` |
+| 2 · IP allow-list | **Open to every IP.** All three rows carry the `'*'` wildcard, so the check passes for any caller; the row must still exist and be `is_active` | `403 IP address not allowed for this endpoint` |
 | 3 · Bearer token | `Authorization: Bearer <token>` from `POST /login` (signature + expiry verified) | `401` |
 
 **The app credentials and the bearer token are the whole authorization**, and
@@ -82,9 +94,9 @@ means for `force_reassign`: **any** holder of a valid token, calling from
 The IP allow-list used to scope that to trusted readers; it no longer does. See
 [Reassigning a card](#reassigning-a-card).
 
-> **Both endpoints still need their own allow-list row** — the wildcard lives
+> **Each endpoint still needs its own allow-list row** — the wildcard lives
 > *in* the row, so a missing or `is_active = false` row is still a `403` before
-> the handler runs. `sql/004_nfc_card.sql` seeds and opens both:
+> the handler runs. `sql/004_nfc_card.sql` seeds and opens all three:
 >
 > ```sql
 > -- what the migration leaves in place
@@ -99,7 +111,8 @@ The IP allow-list used to scope that to trusted readers; it no longer does. See
 > UPDATE attendance.ext_api_allowed_ips
 >    SET ip_address = '{203.0.113.10,203.0.113.11}'::text[]
 >  WHERE endpoint IN ('/ext-api/nfc-card/get_card_info',
->                     '/ext-api/nfc-card/save_card_info');
+>                     '/ext-api/nfc-card/save_card_info',
+>                     '/ext-api/nfc-card/checking_card_reg_status');
 > ```
 
 The token's `sub` is a DU user id. It is recorded as `performed_by` on every
@@ -368,6 +381,130 @@ basename and prefixed with a UUID.
 
 ---
 
+## 3 · `checking_card_reg_status`
+
+**`POST /ext-api/nfc-card/checking_card_reg_status`** — `GET` also accepted.
+
+*Does this student already hold a registered card?* Asked at the desk before a
+card is issued, so the question is about the **student**, and the answer is the
+**whole registration**: which card, both photos, when it was registered and when
+it last changed.
+
+### Request
+
+| Parameter | Required | Notes |
+|---|---|---|
+| `registration_no` | Yes | The student's registration number, e.g. `2017001010`. Matched against `nfc_student_cards.student_applicant_id` — **the same key `save_card_info` upserts on**, so whatever value the desk registered the student under is the value to ask with. |
+
+It goes in any of the four places
+[`get_card_info` accepts its parameter](#where-card_number-can-go) — query
+string, JSON body, form-urlencoded body or multipart body — with the query
+string winning if both are present. The requested form works as-is:
+
+```json
+{ "registration_no": 2017001010 }
+```
+
+An **unquoted number is accepted**, as are quoted strings.
+
+> **The value is trimmed, and nothing else.** Card numbers are
+> [normalised](#card-numbers-are-normalised) — case-folded, separators stripped
+> — but a registration number is **not**: it is an opaque key, and matching more
+> loosely here than `save_card_info` does when it writes would report one
+> student's card under another student's id. `2017001010` and ` 2017001010 `
+> are the same student; `app-2026-00123` and `APP-2026-00123` are not.
+
+There is no student registry to validate against — `student_applicant_id` has
+[no foreign key](#student_applicant_id-has-no-foreign-key) — so a typo'd number
+and a genuinely unregistered student give the same answer.
+
+### Registered — `200 OK`
+
+```json
+{
+  "status": "success",
+  "message": "Registration found for registration no 2017001010",
+  "data": {
+    "is_registered": true,
+    "registration_no": "2017001010",
+    "student_applicant_id": "2017001010",
+    "card_number": "04A1B2C3D4E4",
+    "is_verified": 1,
+    "is_verified_label": "Verified",
+    "registration_type": 1,
+    "registration_type_label": "Admin",
+    "card_image": "https://api.atten.du.ac.bd/uploads/nfc_card/cards/e9d816f4-…_card.png",
+    "student_selfie": "https://api.atten.du.ac.bd/uploads/nfc_card/selfies/f8fca930-…_selfie.png",
+    "registered_at": "2026-09-09T11:02:41.882374+06:00",
+    "updated_at": "2026-09-15T09:18:03.114902+06:00"
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `is_registered` | Always `true` when it appears. Redundant with `status` by construction, and there for a UI that would rather bind one boolean than branch on a string. **There is no `is_registered: false`** — an unregistered student has no `data` object to put it in, so read `status` / `code` for that case. |
+| `registration_no` / `student_applicant_id` | The same column under both names: what you asked with, and what the other two endpoints call it. |
+| `card_number` | The card this student currently holds, in normalised form. |
+| `card_image` / `student_selfie` | Absolute URLs, rebuilt per response like `save_card_info`'s. `null` means no image on file, or a file stored outside the served tree. |
+| `registered_at` / `updated_at` | When the record was created, and when it last changed. |
+
+### Not registered — `404`
+
+```json
+{
+  "status": "error",
+  "code": "card_not_found",
+  "message": "No Data Found",
+  "data": {}
+}
+```
+
+**`data` is an empty object, not absent** — that is this endpoint's contract, so
+a client can read `data` unconditionally. The HTTP status is `404`, the same one
+`get_card_info` returns for the same `code`. If your client treats any non-2xx
+as a transport failure, branch on `status` / `code` rather than on the status
+line — "not registered" is a perfectly good answer here, not an outage.
+
+**A student whose card was re-issued to someone else reads as not
+registered.** Their record survives, images and all, with a `NULL` card number
+(see [Reassigning a card](#reassigning-a-card)) — but they hold no card, so the
+answer is no. Reporting them as registered would stop the desk issuing the
+replacement they came for.
+
+### Errors
+
+| Status | `code` | Case |
+|---|---|---|
+| 400 | `missing_registration_no` | Absent or blank |
+| 404 | `card_not_found` | This student holds no card — i.e. **not registered**, whether the number is unknown or their card was re-issued |
+| 401 | — | Bad app credentials, or missing/invalid/expired token |
+| 403 | — | Caller IP not allow-listed for this path |
+| 500 | `internal_error` | Database error — including `attendance.nfc_card_reg_status` not being applied yet |
+
+Every one of them carries `"data": {}`.
+
+### Which lookup should I call?
+
+|  | `get_card_info` | `checking_card_reg_status` |
+|---|---|---|
+| Question | *Who does this card belong to?* | *Does this student already hold a card?* |
+| Asked with | `card_number` | `registration_no` |
+| Caller | Turnstile / reader, on every tap | Registration desk, before issuing a card |
+| Payload | 4 fields + 2 labels | The whole row: images, timestamps, `is_registered` |
+| `data` on failure | absent | `{}` |
+
+Both read `nfc_student_cards` and never disagree about it — they differ in which
+end they come at it from, and in what the caller is entitled to see. A turnstile
+has no use for a student's selfie, so it does not get one: **don't call
+`checking_card_reg_status` on every tap.**
+
+> **"Registered" is not "verified".** A card with `is_verified: 2` is still
+> registered — it is taken, awaiting review. Reading an unverified record as
+> "not registered" would issue the student a second card.
+
+---
+
 ## Reassigning a card
 
 By default, presenting a card that belongs to someone else is a **`409`**:
@@ -487,8 +624,8 @@ These are not NFC-specific but every call fails without them:
 
 ```bash
 psql "$DATABASE_URL" -f sql/000_ext_api_infra.sql   # allow-list rows
-psql "$DATABASE_URL" -f sql/004_nfc_card.sql        # 2 tables + 3 functions
-# then add the reader's real IP to both allow-list rows (see Auth)
+psql "$DATABASE_URL" -f sql/004_nfc_card.sql        # 2 tables + 5 functions
+# then add the reader's real IP to all three allow-list rows (see Auth)
 ```
 
 `sql/004_nfc_card.sql` is idempotent — every statement is
@@ -518,8 +655,30 @@ as a re-run of `sql/004_nfc_card.sql` (`CREATE OR REPLACE`, no data change).
 > right, the status code is wrong, because the old code looks for a `success`
 > field that no longer exists. Deploy both, and restart.
 
+**Applied to `lms_dev` on 2026-09-16:** `attendance.nfc_card_reg_status` and
+the `/ext-api/nfc-card/checking_card_reg_status` allow-list row, backing the new
+third endpoint. Any other database needs the same re-run:
+
+```sql
+-- after: psql "$DATABASE_URL" -f sql/004_nfc_card.sql
+SELECT proname, pg_get_function_arguments(p.oid)
+  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+ WHERE n.nspname = 'attendance' AND proname = 'nfc_card_reg_status';
+ --> nfc_card_reg_status | p_registration_no character varying
+SELECT endpoint, ip_address, is_active FROM attendance.ext_api_allowed_ips
+ WHERE endpoint = '/ext-api/nfc-card/checking_card_reg_status';
+```
+
+> **That function is `DROP`ped and recreated, not replaced.** It first shipped
+> keyed on `p_card_number`, and Postgres refuses to rename an input parameter
+> through `CREATE OR REPLACE`. `sql/004_nfc_card.sql` therefore carries a
+> `DROP FUNCTION IF EXISTS attendance.nfc_card_reg_status(varchar)` ahead of
+> it. The file stays idempotent and nothing else depends on the function — but
+> between the drop and the create, that one endpoint is a `500`. Keep the SQL
+> and the binary shipping together, as ever.
+
 Still outstanding: the allow-list rows carry `127.0.0.1`/`::1` only, so the card
-reader's real IP has to be added before it can call either endpoint.
+reader's real IP has to be added before it can call any of the endpoints.
 
 ---
 
@@ -563,15 +722,17 @@ these headers, only the two `/ext-api/nfc-card/*` calls do.
 
 ### `403 IP address not allowed for this endpoint`
 
-Both NFC rows are open to every IP, so this should not be reachable on these
-two paths. If it is, the row is missing or `is_active = false` — the check
-matches the **full path**, and each endpoint needs its own row:
+All three NFC rows are open to every IP, so this should not be reachable on
+these paths. If it is, the row is missing or `is_active = false` — the check
+matches the **full path**, and each endpoint needs its own row, so a newly added
+endpoint 403s until its row exists:
 
 ```sql
 UPDATE attendance.ext_api_allowed_ips
    SET ip_address = ip_address || '{*}'::text[], is_active = true
  WHERE endpoint IN ('/ext-api/nfc-card/get_card_info',
-                    '/ext-api/nfc-card/save_card_info');
+                    '/ext-api/nfc-card/save_card_info',
+                    '/ext-api/nfc-card/checking_card_reg_status');
 ```
 
 Behind a reverse proxy the recorded IP is whatever `X-Forwarded-For` resolves
@@ -581,17 +742,23 @@ the proxy and the allow-list stops meaning anything.
 ### `404` with an empty body
 
 Not an application error — the route didn't match. Either the path is wrong, or
-the method is (only `GET` and `POST` are accepted on `get_card_info`, only `POST`
-on `save_card_info`), or **the running binary predates the route** and needs a
-restart. A `404` that carries `{"code":"card_not_found"}` is the opposite case:
-the handler ran and the card is genuinely unknown.
+the method is (`GET` and `POST` on `get_card_info` and
+`checking_card_reg_status`, only `POST` on `save_card_info`), or **the running
+binary predates the route** and needs a restart — the usual cause on
+`checking_card_reg_status`, which is newer than the other two. A `404` that
+carries `{"code":"card_not_found"}` is the opposite case: the handler ran, and
+the card (or the student) is genuinely unknown.
 
-### `400 card_number is required` on a request that sent one
+### `400 card_number is required` / `400 registration_no is required` on a request that sent one
 
 The value went somewhere the endpoint didn't look, or normalised away to
-nothing. `get_card_info` accepts it in the query string, a JSON body, a
-form-urlencoded body, or a multipart body — but a value of `---` or `""`
-normalises to `NULL`, which counts as absent. The step log settles it: on
+nothing. Both lookups accept their parameter in the query string, a JSON body, a
+form-urlencoded body, or a multipart body — but they read **different field
+names**: `card_number` for `get_card_info`, `registration_no` for
+`checking_card_reg_status`. Sending one to the other is the most common cause,
+and it fails with the 400 that names the parameter it wanted. On
+`get_card_info`, a value of `---` or `""` also normalises to `NULL`, which
+counts as absent. The step log settles it: on
 failure it records the method, `Content-Type` and body byte count in the
 `Steps:` section, and when the value *is* found in the body it appears as a
 `body:` line under `Params:`. Absence of that line with a non-zero body size
@@ -630,8 +797,9 @@ no detectable face — a glare-washed card photo or a cropped selfie.
 
 Every call writes one file to `WOW_LOG_DIR`, named `{id}_{timestamp}.log`, with
 the params received, each step, and the response returned. For
-`get_card_info` the `{id}` is the scanned card number; for `save_card_info` it
-is the applicant id.
+`get_card_info` the `{id}` is the scanned card number; for `save_card_info` and
+`checking_card_reg_status` it is the applicant id / registration number, so the
+two calls a desk makes about one student land next to each other.
 
 ```bash
 ls -t uploads/log | head
@@ -653,6 +821,7 @@ Read them on the box, or through the gated
 | Table `student_table` with `Student Applicant ID`, `Card Number`, … | `attendance.nfc_student_cards`, snake_case | No `student_table` exists; column names with spaces would need quoting in every query. Snake_case matches the rest of the schema. |
 | `404 Student not found` when the applicant id is unknown | Not implemented | There is no applicant registry to check against — see [above](#student_applicant_id-has-no-foreign-key). |
 | Errors as `{ "success": false, "error": "…" }` | `{ "status": "error", "message": "…", "code": "…" }` | Superseded by a later request: this module reports outcome as `status` (`"success"`/`"error"`) with a `message`, and carries no `success` boolean and no `error` key. `code` is the stable machine-readable form — match on that, not on the prose. |
+| — (not in the spec) | `checking_card_reg_status`, asked with `registration_no` | Requested later: a desk needs to know whether a student already has a card *before* it registers one, and wants the record it would be clashing with. `get_card_info` could not simply grow the payload — a turnstile calls it on every tap and should not carry images or timestamps — so it is a third endpoint over the same row, entered from the student side. |
 | — (not in the spec) | `is_verified_label` / `registration_type_label` | Requested: the response carries each enum's meaning alongside the number, so a screen need not hard-code the mapping. |
 | Image URLs like `.../cards/APP-2026-00123.jpg` | UUID-prefixed filenames | A deterministic name would clobber the previous image on re-save and lose the audit trail. |
 | Card reassignment "silently / `force_reassign` / blocked" (open question) | `409` by default, `force_reassign=true` to override | Blocking outright would need a DBA for every re-issue; silent overwrite lets a typo'd scan quietly unassign a card. |
@@ -683,6 +852,18 @@ curl -s "${AUTH[@]}" -X POST "$BASE/ext-api/nfc-card/get_card_info" \
 
 # GET still works, for a client written against the spec
 curl -s "${AUTH[@]}" "$BASE/ext-api/nfc-card/get_card_info?card_number=04A1B2C3D4E5"
+
+# Does this student already hold a card? Asked by registration number, in any
+# of the four encodings — the whole registration comes back.
+curl -s "${AUTH[@]}" -X POST "$BASE/ext-api/nfc-card/checking_card_reg_status" \
+  -H 'Content-Type: application/json' -d '{"registration_no":2017001010}'
+curl -s "${AUTH[@]}" -X POST \
+  "$BASE/ext-api/nfc-card/checking_card_reg_status?registration_no=2017001010"
+
+# "Not registered" is a 404 carrying {"code":"card_not_found","data":{}} — the
+# answer to the question, not a failure. Branch on `status`/`code`, not on 200.
+curl -s -o /dev/null -w '%{http_code}\n' "${AUTH[@]}" -X POST \
+  "$BASE/ext-api/nfc-card/checking_card_reg_status?registration_no=9999999999"
 
 # Assign a card, as an admin. Both images are required on EVERY save: they
 # are what the face-match gate compares before anything is written.
