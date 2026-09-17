@@ -199,6 +199,18 @@ async fn main() -> std::io::Result<()> {
                     .service(routes::access_admin::user_role)      // POST /ext-api/access/user-role     (json: person_id, role|null)
                     .service(routes::access_admin::user_override)  // POST /ext-api/access/user-override (json: person_id, permission, effect)
             )
+            // Admin-managed runtime settings. A SEPARATE scope because the
+            // admin panel asked for this path — but wrapped in the SAME gate,
+            // deliberately: a scope outside ExtAuthMiddleware would be a new
+            // unguarded surface on a service whose whole perimeter lives
+            // there. Its allow-list row is seeded by sql/008.
+            .service(
+                web::scope("/admin-api")
+                    .wrap(middleware::api_logger::ApiLogger)
+                    .wrap(middleware::ext_auth_middleware::ExtAuthMiddleware)
+                    .service(routes::settings::get_nfc_face_verify) // GET  /admin-api/settings/nfc-face-verify
+                    .service(routes::settings::put_nfc_face_verify) // PUT  /admin-api/settings/nfc-face-verify (json: nfc_face_verify, nfc_face_verify_url?)
+            )
     })
     .bind((bind_addr, port))?
     .run()

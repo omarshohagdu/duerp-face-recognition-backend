@@ -161,6 +161,28 @@ interchangeable:
 
 The first two moved out of duerp-api on 2026-08-19; `WOW_LOG_DIR` did not.
 
+### The face-verification toggle
+
+`sql/008_system_settings.sql` adds `attendance.system_settings` and
+`GET|PUT /admin-api/settings/nfc-face-verify` — an admin switch for the NFC
+face check, so turning it off during a face-service outage is an API call
+rather than an `.env` edit and a restart.
+
+Applying it changes nothing on its own. The seeded row says `OFF`, but the
+reader only obeys the table once an admin has written to it (`updated_by IS NOT
+NULL`); until then `NFC_FACE_VERIFY_URL` still decides, exactly as before. That
+is deliberate — the alternative would be a migration that silently disables
+face verification on deploy day.
+
+The admin panel screen is **`/settings/face-verification`** (nav: "Face
+verification"), alongside `/access-roles`. Both are admin-only in the nav and
+enforced server-side — hiding a link hides a link.
+
+`/admin-api` is mounted behind the **same** `ExtAuthMiddleware` as `/ext-api`,
+so it needs its allow-list row (seeded) and the app credentials, plus
+`admin.settings.manage`. Values are cached in-process for 30s and the cache is
+dropped on every successful write.
+
 ### Access control (per-person permissions)
 
 Two keys, both safe to leave at their defaults — together they are why a

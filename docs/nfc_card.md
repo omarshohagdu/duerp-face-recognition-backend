@@ -241,8 +241,9 @@ equivalent — they must be in the body.
 
 ### The face-match gate
 
-**Both images are required on every save, and they must be the same person.**
-Before anything is written, the pair is sent to the face-match service:
+**Both images are required on every save, and — when the gate is ON — they must
+be the same person.** Before anything is written, the pair is sent to the
+face-match service:
 
 ```
 POST $NFC_FACE_VERIFY_URL          # e.g. http://10.224.224.101:8089/verify
@@ -270,6 +271,70 @@ face-checked is exactly what the gate exists to prevent, so an outage stops
 card registration rather than quietly letting unchecked pairs through. **If
 saves start failing with 503 `face_verify_unavailable`, the face service — not
 this one — is what to look at.**
+
+#### Turning it on and off
+
+The gate is an **admin setting**, not a deploy-time one:
+
+| | |
+|---|---|
+| **Screen** | `https://attendance.du.ac.bd/settings/face-verification` — "Face verification" in the admin nav |
+| **Read** | `GET /admin-api/settings/nfc-face-verify` → `{ "success": true, "data": { … } }` |
+| **Write** | `PUT /admin-api/settings/nfc-face-verify` → `{ "nfc_face_verify": "ON"\|"OFF", "nfc_face_verify_url": "https://…" }` |
+
+The screen shows **stored** and **effective** side by side, because until
+somebody saves there for the first time the service is still reading
+`NFC_FACE_VERIFY_URL` from `.env` and ignoring the stored rows.
+
+Both need `admin.settings.manage` (held by `admin` and `superadmin`), and they
+**enforce that today**, unlike the audit-mode rollout elsewhere — see
+[`access_control.md`](access_control.md#17--administering-roles-here) for why
+new admin endpoints do not wait.
+
+| Rule | Response |
+|---|---|
+| `nfc_face_verify` not exactly `ON`/`OFF` | `400 invalid_value` |
+| `nfc_face_verify_url` malformed, or `http://` to a **public** host | `400 invalid_url` (the body names the host it objected to) |
+| `ON` with no URL in the request **or** stored | `422 url_required` |
+| Not an admin | `403` · no token `401` |
+
+**https anywhere, or http to a private address.** The face service runs at
+`http://10.224.224.101:8089/verify` on the campus network with no certificate,
+so an https-only rule would have meant the switch could never be turned on for
+the service it exists to control. Plaintext is therefore accepted for RFC1918
+(`10.x`, `172.16–31.x`, `192.168.x`), loopback and `localhost` — and refused
+everywhere else, which is the case that matters: a typo'd
+`http://face.du.ac.bd/verify` would put photographs of students' faces on the
+open internet in clear. A *name* that happens to resolve privately does not
+count; the rule cannot resolve anything, and a name whose DNS somebody else
+controls is how "internal" stops being internal. Prefer https the day the face
+service can offer it.
+
+`nfc_face_verify_url` is optional when you are only flipping the switch;
+sending `""` clears it, which then makes `ON` impossible until a URL is set
+again. Every change writes a row to `attendance.system_settings_audit` — one
+per key changed, with the old value, the new value and the admin's person id.
+
+> **`OFF` means card mappings are written without a face check.** That is what
+> the switch is for, but it is the same outcome as the fail-closed state
+> existing for the opposite reason, so each such save says so in its step log:
+> `face verification is OFF (admin setting) — saving WITHOUT comparing…`.
+
+#### Which configuration wins
+
+| State | What the gate uses |
+|---|---|
+| Nobody has used the API yet (`updated_by IS NULL`) | **`NFC_FACE_VERIFY_URL` from `.env`**, exactly as before — a URL means verify, no URL means refuse |
+| An admin has saved the setting | The stored values, and the environment is ignored |
+
+That first row is deliberate: the seeded value is `OFF`, and taking it at face
+value would have disabled the gate on every deployment that had it working
+through `.env` — silently, on deploy day.
+
+Values are cached in-process for **30 seconds**, and a successful `PUT`
+invalidates that cache before it answers, so the switch takes effect on the
+very next request with no redeploy. A second service instance would see it
+within the TTL.
 
 Two consequences worth planning for:
 
@@ -625,7 +690,7 @@ lands.
 | `WOW_MAX_UPLOAD_MB` | 25 | Per-image ceiling. Shared with the face module. |
 | `WOW_MAX_IMAGE_MB` | 5 | Images above this are compressed down in place after upload. |
 | `WOW_LOG_DIR` | `./uploads/log` | Per-call step logs, one file per call. |
-| `NFC_FACE_VERIFY_URL` | *(unset)* | Face-match endpoint for `save_card_info`, e.g. `http://10.224.224.101:8089/verify`. **Unset means every save is rejected** with 503 — the gate fails closed. |
+| `NFC_FACE_VERIFY_URL` | *(unset)* | Face-match endpoint for `save_card_info`, e.g. `http://10.224.224.101:8089/verify`. **Unset means every save is rejected** with 503 — the gate fails closed. **A fallback now:** once an admin saves the setting (`PUT /admin-api/settings/nfc-face-verify`), the stored value wins and this is ignored — see [Turning it on and off](#turning-it-on-and-off). |
 | `NFC_FACE_VERIFY_API_KEY` | *(empty)* | Sent as `X-API-Key` to that service. A rejected key is a 503, not a 400. |
 | `NFC_FACE_VERIFY_TIMEOUT_SECS` | 30 | Timeout for the match call. It bounds a save, so keep it under the proxy read timeout in front of this service. |
 

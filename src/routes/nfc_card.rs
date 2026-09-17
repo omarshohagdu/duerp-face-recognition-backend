@@ -17,11 +17,19 @@
 //! onto a status, and turn stored paths into public URLs.
 //!
 //! It owns one rule of its own: a save must carry a `card_image` and a
-//! `student_selfie`, and the two must be the same face. That check is a call
-//! to the face-match service (`NFC_FACE_VERIFY_URL`) and happens BEFORE the
+//! `student_selfie`, and — WHEN THE GATE IS ON — the two must be the same
+//! face. That check is a call to the face-match service and happens BEFORE the
 //! SQL function is reached, so a rejected pair leaves no row. It lives here
 //! rather than in SQL because Postgres cannot make the HTTP call — which means
 //! a DBA writing the row directly bypasses it, unlike every other rule above.
+//!
+//! Whether the gate is on, and what URL it calls, is now an ADMIN SETTING
+//! (`attendance.system_settings`, changed through
+//! `PUT /admin-api/settings/nfc-face-verify`), cached in `utils::settings`.
+//! Until somebody uses that API it reads through to `NFC_FACE_VERIFY_URL` in
+//! the environment and behaves exactly as it always did. With the switch OFF,
+//! saves are written WITHOUT a face check — deliberately, attributably, and
+//! logged on every such save.
 //!
 //! AUTH is the bearer token, on top of the `X-App-Id` / `X-App-Password` +
 //! IP allow-list gate `ExtAuthMiddleware` already applies to everything under
@@ -210,17 +218,6 @@ fn status_for_code(code: &str) -> actix_web::http::StatusCode {
 // problem, not a silent one.
 // ---------------------------------------------------------------------
 
-/// Face-match endpoint, e.g. `http://10.224.224.101:8089/verify`.
-///
-/// `None` when unset, which rejects every save rather than letting unchecked
-/// pairs through — see the fail-closed note above.
-fn face_verify_url() -> Option<String> {
-    std::env::var("NFC_FACE_VERIFY_URL")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
 /// Sent as `X-API-Key`. A missing key is forwarded as an empty header rather
 /// than omitted, so the failure surfaces as the service's own 401 in the step
 /// log instead of as a differently-shaped request.
@@ -329,11 +326,16 @@ fn face_verify_message(body: &Value) -> Option<String> {
 /// retaking a photo, the third only by an operator.
 async fn verify_card_selfie_match(
     log: &StepLogger,
+    configured_url: Option<&str>,
     card_path: &str,
     selfie_path: &str,
 ) -> Result<(), HttpResponse> {
-    let Some(url) = face_verify_url() else {
-        log.step("NFC_FACE_VERIFY_URL is not set — refusing the save (gate fails closed)");
+    // The URL comes from the caller — `attendance.system_settings` first, the
+    // environment as the fallback (utils::settings) — rather than being read
+    // here, so the gate and the settings screen can never disagree about which
+    // endpoint is in use.
+    let Some(url) = configured_url.map(str::to_string) else {
+        log.step("no face-verification URL configured — refusing the save (gate fails closed)");
         return Err(face_verify_unavailable(
             "Face verification is not configured; card not saved",
         ));
@@ -1133,10 +1135,31 @@ async fn nfc_save_card_info_inner(
         ));
     };
 
-    // Before the write, never after: a pair the service rejects must leave no
-    // row behind. The files stay on disk either way, like every other rejected
-    // upload here, and are referenced by nothing.
-    if let Err(resp) = verify_card_selfie_match(log, &card_img.path, &selfie_img.path).await {
+    // Is the gate on at all? `attendance.system_settings` decides once an admin
+    // has used PUT /admin-api/settings/nfc-face-verify; until then this reads
+    // through to `NFC_FACE_VERIFY_URL` in the environment and behaves exactly
+    // as it did before the setting existed (utils::settings).
+    //
+    // OFF MEANS THIS SAVE IS NOT FACE-CHECKED. That is what the switch is for,
+    // and it is logged at the point it happens, so a mapping written during an
+    // off period is explainable afterwards — the alternative is a card record
+    // nobody can account for.
+    let gate = crate::utils::settings::face_verify(db.get_ref()).await;
+    if !gate.enabled {
+        log.step(format!(
+            "face verification is OFF ({}) — saving WITHOUT comparing the card photo and the selfie",
+            if gate.managed {
+                "admin setting"
+            } else {
+                "no URL configured"
+            }
+        ));
+    } else if let Err(resp) =
+        // Before the write, never after: a pair the service rejects must leave
+        // no row behind. The files stay on disk either way, like every other
+        // rejected upload here, and are referenced by nothing.
+        verify_card_selfie_match(log, gate.url.as_deref(), &card_img.path, &selfie_img.path).await
+    {
         return resp;
     }
 
