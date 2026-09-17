@@ -81,8 +81,14 @@ and menu items — out of `ictcell` into `attendance`, ids preserved, then seeds
 one rule per endpoint in **audit mode** (`enforce = false`). Applying it refuses
 nothing, and the service does not read any of it yet.
 
-It **reads** `ictcell` and never writes to it; the ERP's own tables are left
-exactly as they are. The flip side is the thing to decide before going further:
+`sql/007_access_admin.sql` adds the API behind the Access Roles screen —
+`POST /ext-api/access/*`, their rule and allow-list rows, and an audit table
+for every change. **Those seven endpoints enforce their permission
+immediately**, whatever `EXT_ACCESS_CONTROL` says: they are new, so nobody
+breaks, and they are what hands out permissions.
+
+sql/006 **reads** `ictcell` and never writes to it; the ERP's own tables are
+left exactly as they are. The flip side is the thing to decide before going further:
 the ERP's admin screens keep writing `ictcell`, so a role assigned there no
 longer reaches this service. §9 of that file has the three ways to resolve it
 (point the ERP at `attendance`, re-sync on a schedule, or administer roles

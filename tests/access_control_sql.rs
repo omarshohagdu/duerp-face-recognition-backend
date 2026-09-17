@@ -543,6 +543,244 @@ async fn registering_a_card_does_not_imply_reassigning_one() {
     assert!(!allowed(&reassign), "but it may NOT reassign: {reassign}");
 }
 
+/// Every permission one role holds, sorted.
+async fn role_permissions(tx: &mut Transaction<'_, Postgres>, role: &str) -> Vec<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT res.key
+           FROM attendance.role_permissions rp
+           JOIN attendance.roles r       ON r.id  = rp.role_id
+           JOIN attendance.resources res ON res.id = rp.resource_id
+          WHERE r.key = $1
+          ORDER BY res.key",
+    )
+    .bind(role)
+    .fetch_all(&mut **tx)
+    .await
+    .expect("role permissions")
+}
+
+#[tokio::test]
+async fn the_card_desk_role_can_issue_cards_but_not_take_them_away() {
+    let pool = db_or_skip!();
+    let mut tx = pool.begin().await.expect("begin");
+
+    // An EXACT set, not a contains-check. Widening a working role is the kind
+    // of change that should be argued for in a diff, and `nfc.card.reassign`
+    // creeping in here is the specific one worth catching: it is the only
+    // irreversible thing a desk can do, and the reason it is a separate
+    // permission at all.
+    assert_eq!(
+        role_permissions(&mut tx, "card_desk").await,
+        vec![
+            "dashboard.view",
+            "nfc.card.read",
+            "nfc.card.register",
+            "nfc.card.status",
+        ],
+        "card_desk has been widened or narrowed — see sql/006_access_control.sql §4c"
+    );
+}
+
+#[tokio::test]
+async fn the_reader_role_can_only_open_a_door() {
+    let pool = db_or_skip!();
+    let mut tx = pool.begin().await.expect("begin");
+
+    // A device account's credentials sit in a machine on a corridor, so this
+    // role is the one worth keeping narrowest: read a card, verify a face.
+    // No registration, no enrolment, no reports, no logs.
+    assert_eq!(
+        role_permissions(&mut tx, "reader").await,
+        vec!["dashboard.view", "face.verify", "nfc.card.read"],
+        "reader has been widened — see sql/006_access_control.sql §4c"
+    );
+}
+
+#[tokio::test]
+async fn the_enrollment_desk_role_registers_faces_and_nothing_else() {
+    let pool = db_or_skip!();
+    let mut tx = pool.begin().await.expect("begin");
+
+    // Exact set. `face.verify` creeping in here would let an enrolment clerk
+    // mark people present, which is the door's job — and
+    // `attendance.report.view` would turn "I register faces" into "I can read
+    // anyone's attendance history".
+    assert_eq!(
+        role_permissions(&mut tx, "enrollment_desk").await,
+        vec!["dashboard.view", "face.enroll"],
+        "enrollment_desk has been widened — see sql/006_access_control.sql §4c"
+    );
+}
+
+#[tokio::test]
+async fn every_endpoint_is_reachable_by_some_role() {
+    let pool = db_or_skip!();
+    let mut tx = pool.begin().await.expect("begin");
+
+    // Not a security rule — a completeness one. An endpoint no role but `admin`
+    // can reach means the people who actually do that job have nowhere to be
+    // put, and enforcing it would stop the work. `admin` is excluded precisely
+    // because it holds everything and would hide the gap.
+    let orphans: Vec<(String, String)> = sqlx::query_as(
+        "SELECT p.endpoint, p.resource_key
+           FROM attendance.ext_api_endpoint_permissions p
+          WHERE p.is_active
+            AND p.resource_key IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1
+                  FROM attendance.role_permissions rp
+                  JOIN attendance.roles r      ON r.id = rp.role_id
+                  JOIN attendance.resources rs ON rs.id = rp.resource_id
+                 WHERE rs.key = p.resource_key
+                   AND r.key NOT IN ('admin', 'superadmin'))
+          ORDER BY 1",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .expect("orphan query");
+
+    // Deliberate exceptions, all admin-only on purpose:
+    //
+    //   * `admin.*` — administering roles, users, menus and reading the step
+    //     logs. These are the administrator's own job by definition, and the
+    //     logs in particular carry usernames, client IPs, GPS, employee ids and
+    //     whole request bodies. "Which role needs to read everyone's requests?"
+    //     has one honest answer, and it is not a desk.
+    //   * `#force_reassign` — taking a card off another student. Handed out per
+    //     person with a `grant` override, never baked into a working role.
+    //
+    // Anything else appearing here is a job with nobody able to do it.
+    let unexpected: Vec<_> = orphans
+        .iter()
+        .filter(|(endpoint, resource)| {
+            !endpoint.ends_with("#force_reassign") && !resource.starts_with("admin.")
+        })
+        .collect();
+
+    assert!(
+        unexpected.is_empty(),
+        "no working role can reach: {unexpected:?} — add it to a role in \
+         sql/006_access_control.sql §4c, or accept it here with the reason"
+    );
+}
+
+#[tokio::test]
+async fn the_working_roles_are_refused_where_they_should_be() {
+    let pool = db_or_skip!();
+    let mut tx = pool.begin().await.expect("begin");
+
+    // The point of narrow roles, stated as verdicts rather than grants: put a
+    // real person in each role and check the answers at the endpoints that
+    // matter.
+    for (role, endpoint, expected) in [
+        ("card_desk", "/ext-api/nfc-card/save_card_info", true),
+        ("card_desk", "/ext-api/nfc-card/save_card_info#force_reassign", false),
+        ("card_desk", "/ext-api/wow-attendance/logs/login", false),
+        ("reader", "/ext-api/nfc-card/get_card_info", true),
+        ("reader", "/ext-api/wow-attendance/verify", true),
+        ("reader", "/ext-api/nfc-card/save_card_info", false),
+        ("reader", "/ext-api/wow-attendance/reports/by-date", false),
+        ("enrollment_desk", "/ext-api/wow-attendance/enroll", true),
+        ("enrollment_desk", "/ext-api/wow-attendance/enrolled", true),
+        ("enrollment_desk", "/ext-api/wow-attendance/verify", false),
+        ("enrollment_desk", "/ext-api/nfc-card/save_card_info", false),
+    ] {
+        let fx = fixture(&mut tx).await;
+        let role_id: i32 = sqlx::query_scalar("SELECT id FROM attendance.roles WHERE key = $1")
+            .bind(role)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap_or_else(|_| panic!("role {role} must exist — apply sql/006_access_control.sql"));
+        sqlx::query("UPDATE attendance.app_users SET role_id = $1 WHERE id = $2")
+            .bind(role_id)
+            .bind(fx.user_id)
+            .execute(&mut *tx)
+            .await
+            .expect("assign role");
+
+        let v = can_call(&mut tx, fx.person_id, endpoint).await;
+        assert_eq!(
+            allowed(&v),
+            expected,
+            "{role} at {endpoint}: expected allowed={expected}, got {v}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_admin_role_is_not_locked_out_of_this_service() {
+    let pool = db_or_skip!();
+    let mut tx = pool.begin().await.expect("begin");
+
+    // Every permission point this service defines must be reachable by an
+    // admin. The failure this catches is quiet and nasty: somebody adds an
+    // endpoint rule naming a NEW resource key, nobody grants it to a role, and
+    // the day enforcement is switched on the administrators are the first
+    // people locked out of the thing they administer.
+    //
+    // If a key is deliberately withheld from `admin`, change this test with
+    // that reasoning written down — do not delete it.
+    let missing: Vec<(String, String)> = sqlx::query_as(
+        "SELECT p.endpoint, p.resource_key
+           FROM attendance.ext_api_endpoint_permissions p
+          WHERE p.is_active
+            AND p.resource_key IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1
+                  FROM attendance.role_permissions rp
+                  JOIN attendance.roles r      ON r.id = rp.role_id
+                  JOIN attendance.resources rs ON rs.id = rp.resource_id
+                 WHERE r.key = 'admin' AND rs.key = p.resource_key)
+          ORDER BY 1",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .expect("admin coverage query");
+
+    assert!(
+        missing.is_empty(),
+        "the admin role holds no permission for: {missing:?} — grant it in \
+         sql/006_access_control.sql §4b"
+    );
+}
+
+#[tokio::test]
+async fn an_admin_account_sees_the_access_management_menus() {
+    let pool = db_or_skip!();
+    let mut tx = pool.begin().await.expect("begin");
+
+    // The request this was built for: "allow the access role & permission menu
+    // for admin". Two halves — the role holds the keys, AND somebody is
+    // actually in the role — and the second is the one that was missing.
+    let admin_role: i32 = sqlx::query_scalar("SELECT id FROM attendance.roles WHERE key = 'admin'")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("an admin role must exist");
+
+    let fx = fixture(&mut tx).await;
+    sqlx::query("UPDATE attendance.app_users SET role_id = $1 WHERE id = $2")
+        .bind(admin_role)
+        .bind(fx.user_id)
+        .execute(&mut *tx)
+        .await
+        .expect("make the fixture an admin");
+
+    let p = profile(&mut tx, fx.person_id, "desktop").await;
+    let perms = permissions(&p);
+    for key in ["admin.roles.manage", "admin.users.manage", "admin.menu.manage"] {
+        assert!(perms.contains(&key.to_string()), "admin is missing {key}: {perms:?}");
+    }
+
+    // ...and the screens themselves, which live under a container menu row.
+    let children = child_labels(&p, "User Management");
+    for label in ["Access Roles", "Users", "Menu Information"] {
+        assert!(
+            children.iter().any(|c| c == label),
+            "an admin should see `{label}`, got {children:?}"
+        );
+    }
+}
+
 // =====================================================================
 // access_profile — what the clients render
 // =====================================================================

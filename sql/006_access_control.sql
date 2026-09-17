@@ -267,6 +267,108 @@ INSERT INTO attendance.resources (key, name, category) VALUES
 ON CONFLICT (key) DO NOTHING;
 
 -- ---------------------------------------------------------------------
+-- 4b · Which roles hold this service's permissions
+--
+-- The copied roles arrived with the ERP's own grants and know nothing about
+-- NFC cards or face attendance. Without this section EVERY role holds zero of
+-- the six keys above — so an "admin" can manage roles and menus while being
+-- refused by every endpoint in this service the moment enforcement starts.
+--
+-- `admin` and `superadmin` get all of them. That is the FLOOR, not the target:
+-- a card desk should hold `nfc.card.register` and NOT `nfc.card.reassign`, a
+-- turnstile only `nfc.card.read`. Those narrower roles do not exist yet —
+-- docs/access_control.md §5 has the intended map — and creating them is a
+-- decision about people, not something a migration should invent.
+--
+-- `admin.logs.view` is included for `admin` too. The step logs are how this
+-- service is debugged, and an admin who cannot read them has to ask a DBA; the
+-- ERP's copy had it on `superadmin` alone.
+--
+-- The two management screens an admin needs — `/access-roles` (roles and their
+-- permissions) and `/role_list` (who holds which role) — are already covered:
+-- `admin.roles.manage` and `admin.users.manage` came across with the copy, and
+-- `attendance.access_profile` puts their menu rows in the payload for anyone
+-- holding them. What was missing was somebody actually being an admin; see
+-- section 10.
+-- ---------------------------------------------------------------------
+
+INSERT INTO attendance.role_permissions (role_id, resource_id)
+SELECT r.id, res.id
+  FROM attendance.roles r, attendance.resources res
+ WHERE r.key IN ('admin', 'superadmin')
+   AND res.key IN ('nfc.card.read', 'nfc.card.status', 'nfc.card.register',
+                   'nfc.card.reassign', 'face.enroll', 'face.verify',
+                   'admin.logs.view')
+ON CONFLICT DO NOTHING;
+
+-- ---------------------------------------------------------------------
+-- 4c · Roles for the people and devices that use THIS service
+--
+-- `admin` above can do everything, which is right for administrators and wrong
+-- for everyone else. These three are the working roles from
+-- docs/access_control.md §5, and the point of them is what they do NOT hold.
+--
+-- `card_desk` — a clerk issuing cards. Registers a card, checks whether a
+--   student already has one, reads a card that was handed in. **Not**
+--   `nfc.card.reassign`: taking a card off another student is the one
+--   irreversible thing here, and it is checked separately inside
+--   save_card_info (section 8). One clerk in a hundred needs it; that one gets
+--   a per-person `grant` override, not a wider role.
+--
+-- `reader` — an unattended device at a door. Reads a card, verifies a face,
+--   and nothing else: no registration, no enrolment, no reports, no logs. A
+--   device account's credentials live in a machine on a corridor, so its role
+--   is the one worth keeping narrowest.
+--
+-- `enrollment_desk` — registers a student's face, and answers "is this person
+--   enrolled?" (`check`) and "who is" (`enrolled`), which are the same
+--   permission because they are the same job. **Not** `face.verify`: marking
+--   somebody present is the door's function, not the desk's, and a desk that
+--   wants to confirm an enrolment worked asks `check` instead. Nor
+--   `attendance.report.view` — enrolling people is not a reason to read their
+--   attendance history.
+--
+-- Both carry `dashboard.view`, as every ERP role does, so a human signing in
+-- with one lands on a page rather than a bare shell.
+--
+-- `is_system = false`, unlike the roles copied from the ERP: these are this
+-- deployment's own, and the Access Roles screen may edit them freely.
+--
+-- NOBODY IS IN EITHER ROLE YET. Creating a role is a migration; deciding which
+-- people and which devices hold it is not — see section 10, and
+-- docs/access_control.md §10 for why a device needs an account at all.
+--
+-- IF THESE ROLES ALREADY EXIST they are left exactly as they are, grants
+-- included. A re-run of this file must never widen a role somebody narrowed.
+-- ---------------------------------------------------------------------
+
+INSERT INTO attendance.roles (key, name, is_system) VALUES
+    ('card_desk',       'Card Desk',       false),
+    ('reader',          'Card Reader',     false),
+    ('enrollment_desk', 'Enrollment Desk', false)
+ON CONFLICT (key) DO NOTHING;
+
+INSERT INTO attendance.role_permissions (role_id, resource_id)
+SELECT r.id, res.id
+  FROM (VALUES
+    -- Issue and look up cards, but never take one away.
+    ('card_desk', 'nfc.card.register'),
+    ('card_desk', 'nfc.card.status'),
+    ('card_desk', 'nfc.card.read'),
+    ('card_desk', 'dashboard.view'),
+    -- The door: tap a card, verify a face.
+    ('reader',    'nfc.card.read'),
+    ('reader',    'face.verify'),
+    ('reader',    'dashboard.view'),
+    -- Register faces, and see who is registered.
+    ('enrollment_desk', 'face.enroll'),
+    ('enrollment_desk', 'dashboard.view')
+  ) AS want(role_key, resource_key)
+  JOIN attendance.roles     r   ON r.key   = want.role_key
+  JOIN attendance.resources res ON res.key = want.resource_key
+ON CONFLICT DO NOTHING;
+
+-- ---------------------------------------------------------------------
 -- 5 · Endpoint → permission map
 --
 -- The missing link: `resources` holds permission keys, `ext_api_allowed_ips`
@@ -689,6 +791,26 @@ SELECT '/ext-api/me/access', '{*}'::text[]
 --   SELECT p.endpoint,
 --          attendance.ext_api_can_call(2020111007, p.endpoint) ->> 'reason' AS reason
 --     FROM attendance.ext_api_endpoint_permissions p ORDER BY 1;
+--
+-- NOBODY IS AN ADMIN UNTIL SOMEBODY IS
+--   Every copied account arrived with `role_id = NULL` — the ERP never used
+--   that column (docs/access_control.md §7.4). Until it is filled in, the
+--   admin menus are invisible to everyone and every gated endpoint denies
+--   everyone, however complete the grants above are.
+--
+--   Assign the accounts DU already calls admins:
+--
+--   UPDATE attendance.app_users
+--      SET role_id = (SELECT id FROM attendance.roles WHERE key = 'admin')
+--    WHERE lower(du_base_role) = 'admin' AND role_id IS NULL;
+--
+--   ...and check who that was, because `du_base_role` is free text and the
+--   spellings are inconsistent ('Officer', 'faculty', 'ExamControllerUser'):
+--
+--   SELECT person_id, username, du_base_role, role_id FROM attendance.app_users
+--    ORDER BY role_id NULLS LAST, person_id;
+--
+--   To undo one:  UPDATE attendance.app_users SET role_id = NULL WHERE person_id = …;
 --
 -- RE-SYNC FROM THE ERP (option (b) in the header)
 --   Roles and accounts only — NOT the endpoint rules or this service's own

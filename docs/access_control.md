@@ -15,7 +15,7 @@ service does not read it yet, and nothing is enforced.**
 |---|---|
 | `sql/006_access_control.sql` — 7 tables, the ERP row copy, both functions, 14 endpoint rules | **built**, applied to `lms_dev`, all rules `enforce = false` |
 | `docs/attendance_schema.sql` §6 — the same objects (empty), for a fresh deployment | **in step** with the migration; the rows and rules stay in `sql/006` |
-| Keeping the copy in step with the ERP's admin screens | **not decided** — see [§2.1](#21--this-service-owns-a-copy) |
+| Keeping the copy in step with the ERP's admin screens | **decided: option (c)** — administered here, `POST /ext-api/access/*` + the Access Roles screen ([§17](#17--administering-roles-here)) |
 | `tests/access_control_sql.rs` — 20 DB-backed tests | **built**, passing |
 | Middleware check (§6) | **built**, running in **audit mode** — asks on every request, refuses nothing |
 | `force_reassign` permission point (§5) | **built** — the one check a path cannot express |
@@ -576,14 +576,18 @@ table over a claim** — see [§3](#why-not-put-roles-in-the-jwt).
 
 ### 7.4 · The data is not ready yet
 
-Two facts from the live `lms_dev` rows, both of which will deny everybody if
-enforcement is switched on today:
+Two facts from the live `lms_dev` rows. The first has been half-fixed; the
+second is untouched, and between them most people are still denied:
 
-- **`app_users.role_id` is `NULL` for all 16 accounts.** Nobody has a role, so
-  `role_permissions` matches nothing.
+- **`app_users.role_id` was `NULL` for all 16 accounts.** The two whose
+  `du_base_role` is `admin` now hold the `admin` role (2026-09-17) — so the
+  access-management menus are visible to somebody, which is what makes the
+  system administrable at all. **The other 14 still have no role**, including
+  every card desk and every reader.
 - **`du_base_role` is free text and inconsistent** — `admin`, `Officer`,
   `faculty`, `Guest_Teacher`, `ThirdGeneral`, `ExamControllerUser`, `student` —
-  with case that does not match `roles.key`.
+  with case that does not match `roles.key`. Only the `admin` spelling happened
+  to match; the rest need a decision per role, not a bulk UPDATE.
 
 Pick one before enforcing:
 
@@ -608,8 +612,10 @@ column wins silently whenever someone forgets to set `role_id`. Prefer A.
 
 > **Check your own account before you flip the switch.** The account this
 > service is developed from (`person_id = 2020111007`) is `du_base_role =
-> Officer`, `role_id = NULL` — under any of the maps in §5 it is denied. Grant
-> yourself first, from a psql prompt, and verify with §9's query.
+> Officer`, so the admin backfill did **not** cover it — and the `officer` role
+> holds `dashboard.view` and nothing else. Under any of the maps in §5 it is
+> denied everything. Grant yourself first, from a psql prompt, and verify with
+> §9's query.
 
 ---
 
@@ -699,6 +705,55 @@ hard-coded subset; if it filters by `category`, use a category it already shows.
 > **Those screens currently write `ictcell`, which this service no longer
 > reads.** Until [§2.1](#21--this-service-owns-a-copy)'s question is answered,
 > the psql recipes below are the only way to change what this service enforces.
+
+### Who holds what today
+
+```sql
+-- Roles, and how many people are in each. 14 of 16 accounts still have none.
+SELECT coalesce(r.key, '(no role)') AS role, count(*)
+  FROM attendance.app_users au
+  LEFT JOIN attendance.roles r ON r.id = au.role_id
+ GROUP BY 1 ORDER BY 2 DESC;
+
+-- Everything one role may do.
+SELECT res.key FROM attendance.role_permissions rp
+  JOIN attendance.roles r      ON r.id  = rp.role_id
+  JOIN attendance.resources res ON res.id = rp.resource_id
+ WHERE r.key = 'admin' ORDER BY 1;
+```
+
+`admin` and `superadmin` hold **every** permission this service defines,
+including the six `nfc.*` / `face.*` keys and `admin.logs.view`
+(`sql/006_access_control.sql` §4b) — right for administrators, wrong for
+everyone else. Three working roles exist for the rest (§4c), and what they do
+**not** hold is the point:
+
+| Role | Holds | Deliberately not |
+|---|---|---|
+| `card_desk` | `nfc.card.register`, `nfc.card.status`, `nfc.card.read`, `dashboard.view` | **`nfc.card.reassign`** — taking a card off another student. The one clerk who needs it gets a per-person `grant` override, not a wider role |
+| `reader` | `nfc.card.read`, `face.verify`, `dashboard.view` | registration, enrolment, reports, logs. A device's credentials sit in a machine on a corridor, so this is the role worth keeping narrowest |
+| `enrollment_desk` | `face.enroll`, `dashboard.view` | `face.verify` — marking somebody present is the door's job, and a desk confirming an enrolment worked asks `check` instead. Also not `attendance.report.view`: enrolling people is no reason to read their history |
+
+All three are `is_system = false`, so the Access Roles screen may edit them.
+**Nobody is in any of them yet** — the desks need people, and the readers need
+accounts at all (§10). `tests/access_control_sql.rs` pins all three sets
+exactly, so widening one is a deliberate diff rather than a quiet grant.
+
+It also asserts that **every endpoint is reachable by some role other than
+`admin`** — a completeness check, not a security one: an endpoint only an admin
+can reach means the people who actually do that job have nowhere to be put, and
+enforcing it would stop the work. Two exceptions are recorded there with their
+reasons:
+
+- **`#force_reassign`** — handed out per person with a `grant` override.
+- **`logs/login` and `logs/attendance`** — the step logs carry usernames,
+  client IPs, GPS, employee ids and whole request bodies. "Which role needs to
+  read everyone's requests?" has one honest answer, and it is not a desk.
+
+`tests/access_control_sql.rs` pins the invariant that an admin is never locked
+out of a permission point this service defines: add an endpoint rule naming a
+new key and forget to grant it, and that test fails rather than the
+administrators discovering it on the day enforcement starts.
 
 ### From psql — the equivalents
 
@@ -1211,6 +1266,81 @@ is an UPDATE, not a deploy.
 
 ---
 
+## 17 · Administering roles here
+
+**Built.** `sql/007_access_admin.sql` + `src/routes/access_admin.rs` +
+`duerp-face-recognition-frontend` → **`/access-roles`**.
+
+This is [§2.1](#21--this-service-owns-a-copy) option (c): the roles this
+service enforces are edited in this service. The ERP's own `/access-roles`
+still exists and still writes `ictcell` — it does **not** reach the gate here,
+and the two screens have the same name on purpose only in the sense that they
+do the same job for different systems.
+
+| Endpoint | Permission | Does |
+|---|---|---|
+| `POST /ext-api/access/roles` | `admin.roles.manage` | roles, their permissions, member counts |
+| `POST /ext-api/access/resources` | `admin.roles.manage` | the permission vocabulary, with the endpoints each key opens |
+| `POST /ext-api/access/role-save` | `admin.roles.manage` | create/update a role and **replace** its permission set |
+| `POST /ext-api/access/role-delete` | `admin.roles.manage` | delete an unused, non-system role |
+| `POST /ext-api/access/users?search=&limit=&offset=` | `admin.users.manage` | accounts, their role, overrides, and **effective** permissions |
+| `POST /ext-api/access/user-role` | `admin.users.manage` | put a person in a role, or take them out |
+| `POST /ext-api/access/user-override` | `admin.users.manage` | one person's exception: `grant` / `deny` / `clear` |
+
+### These enforce from day one
+
+The one deliberate exception to the audit-mode rollout in §6/§8. That rollout
+is cautious because every other endpoint has existing callers who would break;
+these have none, and they are the API that **hands out permissions**. Serving
+them in audit mode would let any token holder make themselves an admin — a
+strictly worse failure than a new screen 403ing on its first day. So the
+handler reads the verdict and ignores both `EXT_ACCESS_CONTROL` and the rule
+row's `enforce`.
+
+### The guards, and why each one exists
+
+All four are in SQL, so they hold for a DBA at a psql prompt as well as for the
+screen:
+
+| Refusal | `code` | Why |
+|---|---|---|
+| Removing `admin.roles.manage` from `admin` | `would_lock_out` | It is the permission that reaches this API. Remove it and nobody can give it back — a psql prompt becomes the only way home |
+| Demoting the last active admin | `last_admin` | The same lockout, from the other end |
+| Deleting a role somebody holds | `role_in_use` | Their `role_id` would go `NULL`, which reads as "denied everything" once enforcement is on, and nobody would connect the two |
+| Renaming or deleting a system role's key | `system_role` | duerp-api still joins on those keys |
+
+Plus the ordinary ones: an invalid key (`invalid_key` — it ends up in queries
+and guards), an unknown permission (`unknown_permission`, refused rather than
+silently dropped, which would leave the screen showing a permission the role
+does not hold), and no such account (`no_account`).
+
+### `permissions` is the whole set
+
+`role-save` **replaces**. A key left out is a revocation — that is what
+unticking a box means — so a client that sends a partial list silently strips
+the rest. The audit row records both sides.
+
+### Every write is audited
+
+`attendance.access_admin_audit` holds the actor (the token's `sub`), the
+action, the target, and a `detail` with before and after. "Who gave them that?"
+is the first question asked after an incident, and the step logs answer "who
+called what", not "what did it change".
+
+```sql
+SELECT created_at, actor, action, target, detail
+  FROM attendance.access_admin_audit ORDER BY id DESC LIMIT 20;
+```
+
+### The screen
+
+`/access-roles` in the attendance panel, admin-only in the nav — **hiding it
+hides a link; the API is the gate.** Two tabs: *Roles & permissions* (pick a
+role, tick what it may do, save) and *People* (search, assign a role, see each
+account's effective permissions and overrides).
+
+---
+
 ## 16 · Decisions to confirm before building
 
 1. ~~Reuse `ictcell` roles, or keep this service's own copy?~~ **Decided: own
@@ -1245,7 +1375,7 @@ nothing before step 8 can refuse a request:
 | # | Step | Where | |
 |---|---|---|---|
 | 0 | **Decide how roles get assigned now that the copy exists** — §2.1 (a)/(b)/(c) | with duerp-api | |
-| 1 | Backfill `app_users.role_id`; agree the role list | `attendance.app_users` (§7.4) | |
+| 1 | Backfill `app_users.role_id`; agree the role list | `attendance.app_users` (§7.4) | **partly** — 3 admins; `card_desk` and `reader` exist but are empty |
 | 2 | Seed this service's resource keys | `attendance.resources` (§4.3) | **done** |
 | 3 | `ext_api_endpoint_permissions` table + `ext_api_can_call()` | `sql/006_access_control.sql` | **done** |
 | 4 | Seed one row per endpoint, all `enforce = false` | same file (§5) | **done** |

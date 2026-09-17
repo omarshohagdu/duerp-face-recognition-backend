@@ -185,6 +185,19 @@ async fn main() -> std::io::Result<()> {
                     // screen without it. The payload is rendering hints only;
                     // ExtAuthMiddleware is what refuses. See docs/access_control.md.
                     .service(routes::access::me_access) // GET|POST /ext-api/me/access?platform=desktop|mobile|kiosk
+                    // Role administration — the Access Roles screen. These
+                    // ENFORCE their permission unconditionally, unlike the
+                    // audit-mode gate: they are new (nobody to break) and they
+                    // hand out permissions, so serving them in audit mode would
+                    // let any token holder make themselves an admin. See
+                    // src/routes/access_admin.rs and docs/access_control.md.
+                    .service(routes::access_admin::roles_list)     // POST /ext-api/access/roles
+                    .service(routes::access_admin::resources_list) // POST /ext-api/access/resources
+                    .service(routes::access_admin::role_save)      // POST /ext-api/access/role-save     (json: key, name, permissions[])
+                    .service(routes::access_admin::role_delete)    // POST /ext-api/access/role-delete   (json: key)
+                    .service(routes::access_admin::users_list)     // POST /ext-api/access/users?search=&limit=&offset=
+                    .service(routes::access_admin::user_role)      // POST /ext-api/access/user-role     (json: person_id, role|null)
+                    .service(routes::access_admin::user_override)  // POST /ext-api/access/user-override (json: person_id, permission, effect)
             )
     })
     .bind((bind_addr, port))?
