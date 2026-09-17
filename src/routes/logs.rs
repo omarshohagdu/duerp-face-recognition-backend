@@ -322,3 +322,56 @@ pub async fn wow_attendance_logs(
 ) -> HttpResponse {
     handle(&req, attendance_log_dir(), &query)
 }
+
+// ---------------------------------------------------------------------
+// Tests
+//
+// The filename parser is the contract between this reader and the writer
+// (`utils::step_logger`). duerp-api's log viewer carries its own copy of the
+// same logic over the same folders, so a change here is a change there.
+// ---------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_an_ordinary_name() {
+        let (id, at) = parse_log_name("2017001010_20260917_10_28_30_AM.log").expect("parsed");
+        assert_eq!(id, "2017001010");
+        assert_eq!(at.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-09-17 10:28:30");
+        // 12-hour parsing: an afternoon call must not sort into the morning.
+        let (_, pm) = parse_log_name("2017001010_20260917_03_05_09_PM.log").expect("parsed");
+        assert_eq!(pm.format("%H:%M:%S").to_string(), "15:05:09");
+    }
+
+    #[test]
+    fn parses_a_name_disambiguated_by_a_collision() {
+        // Two calls for one id in one second: the writer suffixes the ID
+        // (`utils::step_logger::write_without_clobbering`) precisely so the
+        // five trailing segments still parse here.
+        let (id, at) = parse_log_name("2017001010-2_20260917_10_28_30_AM.log").expect("parsed");
+        assert_eq!(id, "2017001010-2");
+        assert_eq!(at.format("%H:%M:%S").to_string(), "10:28:30");
+        // And the listing's filter is `contains`, so the bare id still finds it.
+        assert!(id.contains("2017001010"));
+    }
+
+    #[test]
+    fn parses_an_id_that_contains_underscores() {
+        // A failed login is filed under the submitted username, which is why
+        // the parse is from the right rather than the left.
+        let (id, _) = parse_log_name("first_last@du.ac.bd_20260917_10_28_30_AM.log")
+            .expect("parsed");
+        assert_eq!(id, "first_last@du.ac.bd");
+    }
+
+    #[test]
+    fn rejects_what_it_cannot_date() {
+        // Skipped by the listing rather than shown with a fabricated time.
+        assert!(parse_log_name("nonsense.log").is_none());
+        assert!(parse_log_name("2017001010_20260917_10_28_30_AM.txt").is_none());
+        assert!(parse_log_name("_20260917_10_28_30_AM.log").is_none());
+        // 25 o'clock is not a 12-hour time.
+        assert!(parse_log_name("x_20260917_25_28_30_AM.log").is_none());
+    }
+}

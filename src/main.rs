@@ -179,6 +179,12 @@ async fn main() -> std::io::Result<()> {
                     .service(routes::nfc_card::nfc_get_card_info)  // GET|POST /ext-api/nfc-card/get_card_info?card_number= (or in the body)
                     .service(routes::nfc_card::nfc_save_card_info) // POST /ext-api/nfc-card/save_card_info (multipart: student_applicant_id, card_number, is_verified, registration_type, force_reassign, card_image, student_selfie)
                     .service(routes::nfc_card::nfc_checking_card_reg_status) // GET|POST /ext-api/nfc-card/checking_card_reg_status?registration_no= (or in the body)
+                    // What the caller may do, and what their client should
+                    // render. Open to any authenticated caller — its rule row
+                    // carries no permission, because a client cannot draw a
+                    // screen without it. The payload is rendering hints only;
+                    // ExtAuthMiddleware is what refuses. See docs/access_control.md.
+                    .service(routes::access::me_access) // GET|POST /ext-api/me/access?platform=desktop|mobile|kiosk
             )
     })
     .bind((bind_addr, port))?

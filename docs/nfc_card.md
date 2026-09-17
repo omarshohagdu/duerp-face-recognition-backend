@@ -88,7 +88,9 @@ All three endpoints sit under `/ext-api`, so `ExtAuthMiddleware` applies first:
 | 3 · Bearer token | `Authorization: Bearer <token>` from `POST /login` (signature + expiry verified) | `401` |
 
 **The app credentials and the bearer token are the whole authorization**, and
-the app credentials are shared by every ext-api client. Be aware of what that
+the app credentials are shared by every ext-api client. (Per-person permissions
+— "this desk may register cards but not reassign them" — are designed in
+[`access_control.md`](access_control.md) and **not built yet**.) Be aware of what that
 means for `force_reassign`: **any** holder of a valid token, calling from
 **anywhere that can reach the service**, can take a card off another student.
 The IP allow-list used to scope that to trusted readers; it no longer does. See
@@ -531,6 +533,23 @@ Re-issuing the same physical card to a new student needs
 
 A student left with a `NULL` card number can be given a new one normally, so the
 card-loss path works end to end.
+
+### It is a separate permission
+
+`force_reassign` is gated on its own, apart from the permission to register a
+card at all: a desk that may issue cards does **not** thereby get to take one
+off another student. The check is in the handler, against `nfc.card.reassign`,
+and a caller without it gets:
+
+```json
+{ "status": "error", "code": "forbidden",
+  "message": "You may register a card, but not reassign one already issued to another student" }
+```
+
+**Today it refuses nobody** — the access layer ships in audit mode, so the
+attempt is recorded and the save proceeds. See
+[`access_control.md`](access_control.md#force_reassign-is-a-second-decision-inside-one-endpoint--built)
+for what turning it on involves.
 
 ---
 

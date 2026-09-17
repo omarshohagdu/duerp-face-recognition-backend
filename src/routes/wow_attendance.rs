@@ -2790,6 +2790,38 @@ async fn wow_verify_inner(
 // `TokenUser` stays private — the id and the log line are everything a handler
 // outside this module needs, and exposing the type would invite duplicating
 // the validation rather than calling it.
+/// Who does this request's bearer token claim to be — without rejecting it.
+///
+/// `require_token_caller` above is the one that 401s. This one answers the
+/// weaker question the access-control middleware asks, and swallows every
+/// failure, because that middleware runs BEFORE the handlers and must not
+/// start rejecting requests on its own: a missing or unreadable token is
+/// simply "no identity", and the endpoint's own rule decides what that is
+/// worth. The handler still applies its own token check afterwards.
+///
+/// Takes a `HeaderMap` rather than an `HttpRequest` because the middleware
+/// holds a `ServiceRequest`, which is a different type with the same headers.
+///
+/// The bool is `true` when the signature could NOT be verified — a legacy DU
+/// token (see `TokenSource::LegacyDu`). **An authorization decision made on
+/// that identity is only as good as `WOW_ACCEPT_DU_TOKEN` being off**, because
+/// such a token can claim any `sub`; it is returned so the audit trail can
+/// name the calls still arriving that way.
+pub(crate) fn token_identity(headers: &actix_web::http::header::HeaderMap) -> Option<(i64, bool)> {
+    let token = headers
+        .get(actix_web::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| {
+            h.strip_prefix("Bearer ")
+                .or_else(|| h.strip_prefix("bearer "))
+        })
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+
+    let user = user_from_token(token).ok()?;
+    Some((user.person_id, user.source == TokenSource::LegacyDu))
+}
+
 pub(crate) fn require_token_caller(
     req: &actix_web::HttpRequest,
 ) -> Result<(i64, String), HttpResponse> {

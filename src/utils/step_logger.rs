@@ -1,6 +1,7 @@
 // Per-call step logger.
 //
-// Writes one log file per API call to `<WOW_LOG_DIR>/{id}_{time}.log`, capturing an
+// Writes one log file per API call to `<WOW_LOG_DIR>/{id}_{time}.log` (or
+// `{id}-2_{time}.log` when one id makes two calls inside one second), capturing an
 // ordered, timestamped line for every step the handler goes through. The file
 // is flushed on Drop, so it is written no matter which branch the handler
 // returns from (including every early `return`) — as long as the logger stays
@@ -185,8 +186,9 @@ pub struct StepLogger {
     // The person / entity id the call is about. Unknown until the request is
     // inspected, so it starts as a placeholder and is updated via `set_id`.
     id: RefCell<String>,
-    // Timestamp captured when the call started; part of the file name so
-    // repeated calls for the same id never overwrite each other.
+    // Timestamp captured when the call started; part of the file name, to the
+    // second. Two calls for one id CAN land in the same second — `Drop` is what
+    // keeps them from overwriting each other.
     time: String,
     // Human-readable start time used inside the file header.
     started_at: String,
@@ -417,6 +419,11 @@ impl StepLogger {
     }
 }
 
+/// How many `-2`, `-3`, … names to try before falling back to a nanosecond
+/// suffix. A person cannot make 50 calls in one second; a load test can, and
+/// the fallback is there for it.
+const MAX_NAME_ATTEMPTS: u32 = 50;
+
 impl Drop for StepLogger {
     fn drop(&mut self) {
         let dir = &self.dir;
@@ -425,7 +432,6 @@ impl Drop for StepLogger {
             return;
         }
         let id = Self::sanitize(&self.id.borrow());
-        let path = format!("{}/{}_{}.log", dir.trim_end_matches('/'), id, self.time);
 
         let mut content = String::new();
         content.push_str(&format!("route: {}\n", self.route));
@@ -438,8 +444,93 @@ impl Drop for StepLogger {
         content.push_str("----\n");
         content.push_str(&self.body());
 
-        if let Err(e) = std::fs::write(&path, content) {
-            eprintln!("StepLogger: write {path} failed: {e}");
+        Self::write_without_clobbering(dir, &id, &self.time, &content);
+    }
+}
+
+impl StepLogger {
+    /// Write the file, and never on top of one that is already there.
+    ///
+    /// `{id}_{time}.log` names the call to the SECOND, and two calls for one id
+    /// inside one second is not hypothetical: a client that retries, a desk
+    /// that double-clicks, or a test loop all produce it. `fs::write` silently
+    /// replaced the earlier file — losing exactly the log you wanted when
+    /// something was going wrong fast.
+    ///
+    /// The fix is `create_new`, which is atomic: whoever wins the create owns
+    /// the name, and every loser tries the next one. That matters here because
+    /// this service runs 16 workers, so the two racing writers are usually in
+    /// different threads and can be in different processes.
+    ///
+    /// THE NAME FORMAT IS UNCHANGED — deliberately. The disambiguator goes on
+    /// the ID, as `{id}-2_{time}.log`, so the last five underscore-separated
+    /// segments are still `{date}_{hh}_{mm}_{ss}_{ampm}`. Both readers parse
+    /// from the right (`routes::logs::parse_log_name`, and duerp-api's viewer,
+    /// which merges both services' folders), so they keep working with no
+    /// change on either side — and because they match the id by `contains`, a
+    /// filter for `2017001010` still finds `2017001010-2`.
+    fn write_without_clobbering(dir: &str, id: &str, time: &str, content: &str) {
+        use std::io::Write;
+
+        let dir = dir.trim_end_matches('/');
+        let mut last_err = None;
+
+        for attempt in 1..=MAX_NAME_ATTEMPTS {
+            // The first attempt is the name this has always produced, so an
+            // uncontended call — which is almost all of them — is byte for byte
+            // what it was before.
+            let path = if attempt == 1 {
+                format!("{dir}/{id}_{time}.log")
+            } else {
+                format!("{dir}/{id}-{attempt}_{time}.log")
+            };
+
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    if let Err(e) = file.write_all(content.as_bytes()) {
+                        eprintln!("StepLogger: write {path} failed: {e}");
+                    }
+                    return;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    // A real failure — permissions, a full disk. Trying 49 more
+                    // names will not fix it.
+                    eprintln!("StepLogger: create {path} failed: {e}");
+                    return;
+                }
+            }
+        }
+
+        // 50 calls for one id in one second. Nanoseconds are effectively unique
+        // and still keep the five trailing segments intact.
+        let nanos = chrono::Utc::now().timestamp_subsec_nanos();
+        let path = format!("{dir}/{id}-{nanos:09}_{time}.log");
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(content.as_bytes()) {
+                    eprintln!("StepLogger: write {path} failed: {e}");
+                }
+            }
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+
+        if let Some(e) = last_err {
+            // Deliberately NOT falling back to an overwriting write: losing this
+            // call's log is bad, silently destroying another call's is worse.
+            eprintln!(
+                "StepLogger: gave up naming a file for id={id} time={time} in {dir}: {e}"
+            );
         }
     }
 }
@@ -735,6 +826,101 @@ mod tests {
         let content = std::fs::read_to_string(dir.join(&name)).unwrap();
         assert!(!content.contains("abc123"), "token leaked:\n{content}");
         assert!(content.contains("endpoint: POST /ext-api/test?id=7&token=[redacted]"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn two_calls_for_one_id_in_one_second_both_survive() {
+        // The bug this fixes: `{id}_{time}.log` names a call to the second, so
+        // a client that retries — or a desk that double-clicks — produced two
+        // loggers with the SAME name, and the second silently replaced the
+        // first. The lost file was invariably the interesting one.
+        let dir = std::env::temp_dir().join(format!("steplog_collide_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dir_s = dir.to_str().unwrap().to_string();
+
+        {
+            let a = StepLogger::new_in("ext-api/test", &dir_s);
+            a.set_id("2017001010");
+            a.step("first call");
+
+            let mut b = StepLogger::new_in("ext-api/test", &dir_s);
+            // Force the collision rather than hoping the clock cooperates:
+            // same id, same second, which is exactly the real-world case.
+            b.time = a.time.clone();
+            b.set_id("2017001010");
+            b.step("second call");
+        }
+
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".log"))
+            .collect();
+        names.sort();
+
+        assert_eq!(names.len(), 2, "both calls must be on disk, got {names:?}");
+        // The uncontended name is untouched — an ordinary call still produces
+        // byte for byte what it always did.
+        assert!(names.iter().any(|n| n.starts_with("2017001010_")), "{names:?}");
+        // ...and the loser of the race is disambiguated on the ID, which keeps
+        // the five trailing timestamp segments where both readers expect them.
+        assert!(names.iter().any(|n| n.starts_with("2017001010-2_")), "{names:?}");
+
+        // Each file is its own call, not one written twice.
+        let bodies: Vec<String> = names
+            .iter()
+            .map(|n| std::fs::read_to_string(dir.join(n)).unwrap())
+            .collect();
+        assert!(bodies.iter().any(|b| b.contains("first call")), "first call lost");
+        assert!(bodies.iter().any(|b| b.contains("second call")), "second call lost");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_disambiguated_name_keeps_the_timestamp_where_readers_look() {
+        // `routes::logs::parse_log_name` — and duerp-api's viewer, which reads
+        // both services' folders — split from the RIGHT on five segments:
+        // {id}_{yyyymmdd}_{hh}_{mm}_{ss}_{ampm}. The suffix therefore has to go
+        // on the id, never on the end. If this assertion ever fails, every log
+        // written during a collision has become invisible in both viewers.
+        let dir = std::env::temp_dir().join(format!("steplog_shape_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dir_s = dir.to_str().unwrap().to_string();
+
+        {
+            let a = StepLogger::new_in("ext-api/test", &dir_s);
+            a.set_id("2017001010");
+            let mut b = StepLogger::new_in("ext-api/test", &dir_s);
+            b.time = a.time.clone();
+            b.set_id("2017001010");
+        }
+
+        let name = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .find(|n| n.contains("-2_"))
+            .expect("a disambiguated file");
+
+        let stem = name.strip_suffix(".log").unwrap();
+        let parts: Vec<&str> = stem.rsplitn(6, '_').collect();
+        assert_eq!(parts.len(), 6, "{name} does not split into id + 5 segments");
+        let (ampm, ss, mm, hh, date, id) =
+            (parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]);
+        assert!(matches!(ampm, "AM" | "PM"), "{name}");
+        assert_eq!(date.len(), 8, "{name}");
+        for seg in [ss, mm, hh] {
+            assert_eq!(seg.len(), 2, "{name}");
+            assert!(seg.chars().all(|c| c.is_ascii_digit()), "{name}");
+        }
+        // The id the viewer shows and filters on. Both readers match it with
+        // `contains`, so a filter for the bare id still finds this file.
+        assert_eq!(id, "2017001010-2");
+        assert!(id.contains("2017001010"));
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

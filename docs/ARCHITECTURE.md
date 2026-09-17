@@ -158,6 +158,15 @@ Two things to know about the gates:
   are written to `wow_attendance_token_mismatch_record` — that table is the
   impersonation-attempt audit trail, and it is the first place to look when
   investigating a disputed check-in.
+- **Authorization is evaluated but not yet enforced.** A valid bearer token
+  still reaches every endpoint in the scope: the reports, the step-log readers,
+  the geo-fence writer, and `save_card_info` with `force_reassign`.
+  `ExtAuthMiddleware` now asks `attendance.ext_api_can_call()` who the caller is
+  and whether they may, records the verdict in
+  `attendance.ext_api_access_audit`, and **serves the request regardless** —
+  `EXT_ACCESS_CONTROL` defaults to `audit` and every endpoint rule is seeded
+  `enforce = false`. Turning that into real refusals is a rollout, not a
+  deploy: [`access_control.md`](access_control.md).
 - **`mapping-save` has no admin gate.** The `WOW_ADMIN_KEY` it once required
   has been removed, so a valid bearer token is enough to move any office's
   geo-fence. The write is still attributed: the token's `sub` goes into the step

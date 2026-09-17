@@ -10,27 +10,64 @@
 -- you suspect they have drifted.
 --
 -- Source database : lms_dev (server 17.6)
--- Generated       : 2026-09-09 10:43 UTC
+-- Generated       : 2026-09-16 11:41 UTC
 -- Command         : /usr/lib/postgresql/17/bin/pg_dump --schema-only \
 --                     --schema=attendance --no-owner --no-privileges
 --
--- Contents: 8 tables, 1 view (attendance.employees, over ictcell.employees),
--- 13 functions, plus sequences, constraints and indexes.
+-- Contents: 18 tables, 1 view (attendance.employees, over ictcell.employees),
+-- 17 functions, plus sequences, constraints and indexes.
+--
+-- WHAT CHANGED SINCE THE PREVIOUS SNAPSHOT (2026-09-09 10:43 UTC)
+-- Nothing was dropped, and no object changed that was not meant to. The
+-- previous snapshot was taken mid-day on the 9th and missed three things that
+-- landed later the same day, which is worth knowing if you have been diffing
+-- against it since:
+--
+--   * `ext_api_allowed_ips` and `ext_api_call_logs` — the ext-api gate, moved
+--     into this schema by sql/005_ext_api_attendance_schema.sql. They are
+--     created by sql/000_ext_api_infra.sql, NOT by docs/attendance_schema.sql,
+--     so their absence from the hand-written file is correct and not drift.
+--   * `nfc_card_labels`, and new bodies for `nfc_card_get_info` /
+--     `nfc_card_save_info` — the NFC status/message envelope and the enum
+--     labels (docs/nfc_card.md). The old snapshot still showed the superseded
+--     `success` boolean.
+--   * `nfc_card_reg_status` — the registration-status lookup, added
+--     2026-09-16 and rekeyed the same day from `p_card_number` to
+--     `p_registration_no`.
+--
+-- Added deliberately in this snapshot: the access-control layer
+-- (sql/006_access_control.sql, docs/access_control.md) — `ext_api_can_call`,
+-- `access_profile`, `ext_api_endpoint_permissions`, and this service's own
+-- copy of the ERP's six RBAC tables (`roles`, `resources`, `role_permissions`,
+-- `app_users`, `user_permission_overrides`, `menu_items`), moved out of
+-- `ictcell` the way sql/005 moved the ext-api gate. NOTHING READS ANY OF IT
+-- YET, and every seeded endpoint rule is in audit mode.
+--
+-- Nothing in this schema references `ictcell` any more except the
+-- `attendance.employees` view.
+--
+-- `ext_api_access_audit` is the newest of them: ExtAuthMiddleware writes a row
+-- there for every request it WOULD have refused, which in audit mode is most of
+-- them. It is evidence for the enforcement rollout, not a permanent log — clear
+-- it once a batch of denials has been fixed.
 --
 -- Schema only — no rows. The identity-adjacent tables here hold employee ids
--- and face-image paths, so data is deliberately NOT dumped into the repo.
+-- and face-image paths, so data is deliberately NOT dumped into the repo. That
+-- also means the SEEDED ROWS that make the gate work — the IP allow-list and
+-- the endpoint rules — are not here; they come from sql/000 and sql/006.
 --
 -- Regenerate:
 --   /usr/lib/postgresql/17/bin/pg_dump --schema-only --schema=attendance \
 --       --no-owner --no-privileges "$DATABASE_URL" > docs/attendance_schema.pgdump.sql
---   (the system pg_dump is 16.x and REFUSES a 17.x server — use the 17 path)
+--   (the system pg_dump is 16.x and REFUSES a 17.x server — use the 17 path,
+--    then paste this header back on top: pg_dump does not preserve it)
 -- =====================================================================
 
 --
 -- PostgreSQL database dump
 --
 
-\restrict D2EIuEMrvhhVOppUV6GKb5TQt3Ks8JZEYWoLlyGHbyZxhtNZzj751Mr7hngiDHS
+\restrict fg7wyKIgtEvQlw0uy4Rp9kqbdBU1yVgdyEz5xqF8zYuwmrppHJsNzRBQrRXpX5J
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 17.9 (Ubuntu 17.9-1.pgdg24.04+1)
@@ -55,6 +92,215 @@ CREATE SCHEMA attendance;
 
 
 --
+-- Name: access_profile(bigint, text); Type: FUNCTION; Schema: attendance; Owner: -
+--
+
+CREATE FUNCTION attendance.access_profile(p_person_id bigint, p_platform text DEFAULT 'desktop'::text) RETURNS jsonb
+    LANGUAGE plpgsql STABLE
+    AS $$
+DECLARE
+    v_user  RECORD;
+    v_perms text[];
+    v_menu  jsonb;
+BEGIN
+    SELECT au.id, au.person_id, au.username, au.status, au.role_id,
+           r.key AS role_key, r.name AS role_name
+      INTO v_user
+      FROM attendance.app_users au
+      LEFT JOIN attendance.roles r ON r.id = au.role_id
+     WHERE au.person_id = p_person_id;
+
+    -- No account, or a suspended one: an EMPTY profile, not an error. The
+    -- client renders a bare shell and every endpoint still refuses them; a
+    -- failure here would only make the app look broken to someone who is
+    -- merely unprivileged.
+    IF NOT FOUND OR coalesce(v_user.status, '') <> 'active' THEN
+        RETURN jsonb_build_object(
+            'status',  'success',
+            'message', 'No access profile for this user',
+            'data', jsonb_build_object(
+                'person_id',   p_person_id,
+                'username',    NULL,
+                'role',        NULL,
+                'role_name',   NULL,
+                'platform',    p_platform,
+                'permissions', '[]'::jsonb,
+                'menu',        '[]'::jsonb,
+                'version',     md5('')));
+    END IF;
+
+    SELECT coalesce(array_agg(DISTINCT res.key ORDER BY res.key), '{}')
+      INTO v_perms
+      FROM attendance.resources res
+     WHERE (EXISTS (SELECT 1 FROM attendance.role_permissions rp
+                     WHERE rp.role_id = v_user.role_id
+                       AND rp.resource_id = res.id)
+            OR EXISTS (SELECT 1 FROM attendance.user_permission_overrides o
+                        WHERE o.user_id = v_user.id
+                          AND o.resource_id = res.id
+                          AND o.effect = 'grant'))
+       AND NOT EXISTS (SELECT 1 FROM attendance.user_permission_overrides o
+                        WHERE o.user_id = v_user.id
+                          AND o.resource_id = res.id
+                          AND o.effect = 'deny');
+
+    WITH visible AS (
+        SELECT m.*, res.key AS resource_key
+          FROM attendance.menu_items m
+          LEFT JOIN attendance.resources res ON res.id = m.resource_id
+         WHERE m.is_active
+           AND p_platform = ANY(m.platforms)
+           -- A row with no resource_id is a container ("User Management"). It
+           -- carries no permission of its own and survives only if something
+           -- under it did — see the final WHERE.
+           AND (m.resource_id IS NULL OR res.key = ANY(v_perms))
+    ),
+    children AS (
+        SELECT parent_id,
+               jsonb_agg(jsonb_build_object(
+                   'id', id, 'label', label, 'icon', icon,
+                   'route', route, 'permission', resource_key)
+                   ORDER BY sort_order) AS items
+          FROM visible
+         WHERE parent_id IS NOT NULL
+         GROUP BY parent_id
+    )
+    SELECT coalesce(jsonb_agg(jsonb_build_object(
+               'id', v.id, 'label', v.label, 'icon', v.icon, 'route', v.route,
+               'permission', v.resource_key,
+               'children', coalesce(c.items, '[]'::jsonb))
+               ORDER BY v.sort_order), '[]'::jsonb)
+      INTO v_menu
+      FROM visible v
+      LEFT JOIN children c ON c.parent_id = v.id
+     WHERE v.parent_id IS NULL
+       -- An empty dropdown is worse than no dropdown: it tells the user there
+       -- is something there and then refuses to open.
+       AND (v.resource_id IS NOT NULL OR c.items IS NOT NULL);
+
+    RETURN jsonb_build_object(
+        'status',  'success',
+        'message', 'Access profile',
+        'data', jsonb_build_object(
+            'person_id',   v_user.person_id,
+            'username',    v_user.username,
+            'role',        v_user.role_key,
+            'role_name',   v_user.role_name,
+            'platform',    p_platform,
+            'permissions', to_jsonb(v_perms),
+            'menu',        v_menu,
+            -- Cheap change-detection for the client, and the cheapest possible
+            -- "your access changed" signal. Covers both halves of the payload,
+            -- so a menu edit invalidates it as surely as a role change does.
+            'version',     md5(v_perms::text || v_menu::text)));
+END;
+$$;
+
+
+--
+-- Name: FUNCTION access_profile(p_person_id bigint, p_platform text); Type: COMMENT; Schema: attendance; Owner: -
+--
+
+COMMENT ON FUNCTION attendance.access_profile(p_person_id bigint, p_platform text) IS 'One person''s permissions + platform-filtered menu for POST /ext-api/me/access. Rendering hints only — attendance.ext_api_can_call() is the gate.';
+
+
+--
+-- Name: ext_api_can_call(bigint, character varying); Type: FUNCTION; Schema: attendance; Owner: -
+--
+
+CREATE FUNCTION attendance.ext_api_can_call(p_person_id bigint, p_endpoint character varying) RETURNS jsonb
+    LANGUAGE plpgsql STABLE
+    AS $$
+DECLARE
+    v_rule     RECORD;
+    v_user     RECORD;
+    v_resource integer;
+    v_effect   text;
+    v_allowed  boolean;
+BEGIN
+    SELECT * INTO v_rule
+      FROM attendance.ext_api_endpoint_permissions
+     WHERE endpoint = p_endpoint
+       AND is_active;
+
+    -- No rule, or a deactivated one. Denied — but `enforce` is reported as
+    -- true so the middleware refuses rather than waving it through: an
+    -- unconfigured path is exactly the case this must not be lenient about.
+    IF NOT FOUND THEN
+        RETURN jsonb_build_object('allowed', false, 'enforce', true,
+            'reason', 'no_rule', 'endpoint', p_endpoint);
+    END IF;
+
+    IF v_rule.resource_key IS NULL THEN
+        RETURN jsonb_build_object('allowed', true, 'enforce', v_rule.enforce,
+            'reason', 'open_to_authenticated');
+    END IF;
+
+    SELECT id INTO v_resource FROM attendance.resources WHERE key = v_rule.resource_key;
+
+    -- A typo'd key must never read as "allowed". It is a config error, and the
+    -- reason code says so rather than blaming the caller.
+    IF v_resource IS NULL THEN
+        RETURN jsonb_build_object('allowed', false, 'enforce', v_rule.enforce,
+            'reason', 'unknown_resource', 'resource_key', v_rule.resource_key);
+    END IF;
+
+    SELECT au.id, au.role_id, au.status, r.key AS role_key
+      INTO v_user
+      FROM attendance.app_users au
+      LEFT JOIN attendance.roles r ON r.id = au.role_id
+     WHERE au.person_id = p_person_id;
+
+    IF NOT FOUND THEN
+        RETURN jsonb_build_object('allowed', false, 'enforce', v_rule.enforce,
+            'reason', 'no_account', 'person_id', p_person_id);
+    END IF;
+
+    -- The kill switch. Tokens live ~730 hours and there is no revocation list,
+    -- so this is what makes "stop that person now" possible at all: the next
+    -- request is refused whatever their token says.
+    IF coalesce(v_user.status, '') <> 'active' THEN
+        RETURN jsonb_build_object('allowed', false, 'enforce', v_rule.enforce,
+            'reason', 'account_inactive', 'status', v_user.status);
+    END IF;
+
+    -- A per-person override beats the role, either way. "Everyone in this role
+    -- except her" has to be expressible, and it only is if a person-level deny
+    -- outranks a role-level grant. At most one row can match: the table's PK is
+    -- (user_id, resource_id), so there is no grant-vs-deny tie to break here.
+    SELECT effect INTO v_effect
+      FROM attendance.user_permission_overrides
+     WHERE user_id = v_user.id AND resource_id = v_resource;
+
+    IF v_effect = 'deny' THEN
+        RETURN jsonb_build_object('allowed', false, 'enforce', v_rule.enforce,
+            'reason', 'denied_by_override');
+    ELSIF v_effect = 'grant' THEN
+        RETURN jsonb_build_object('allowed', true, 'enforce', v_rule.enforce,
+            'reason', 'granted_by_override');
+    END IF;
+
+    v_allowed := EXISTS (
+        SELECT 1 FROM attendance.role_permissions rp
+         WHERE rp.role_id = v_user.role_id
+           AND rp.resource_id = v_resource);
+
+    RETURN jsonb_build_object('allowed', v_allowed, 'enforce', v_rule.enforce,
+        'reason', CASE WHEN v_allowed THEN 'granted_by_role' ELSE 'not_in_role' END,
+        'role', v_user.role_key,
+        'resource_key', v_rule.resource_key);
+END;
+$$;
+
+
+--
+-- Name: FUNCTION ext_api_can_call(p_person_id bigint, p_endpoint character varying); Type: COMMENT; Schema: attendance; Owner: -
+--
+
+COMMENT ON FUNCTION attendance.ext_api_can_call(p_person_id bigint, p_endpoint character varying) IS 'May this person call this path? {allowed, enforce, reason, ...}. Fails closed on no rule / no account / unknown resource.';
+
+
+--
 -- Name: nfc_card_get_info(character varying); Type: FUNCTION; Schema: attendance; Owner: -
 --
 
@@ -67,7 +313,7 @@ DECLARE
 BEGIN
     IF v_card IS NULL THEN
         RETURN jsonb_build_object(
-            'success', false,
+            'status',  'error',
             'code',    'missing_card_number',
             'message', 'card_number is required');
     END IF;
@@ -79,22 +325,50 @@ BEGIN
 
     IF NOT FOUND THEN
         RETURN jsonb_build_object(
-            'success', false,
+            'status',  'error',
             'code',    'card_not_found',
-            'message', 'Card not recognized');
+            'message', 'No Data Found');
     END IF;
 
     RETURN jsonb_build_object(
-        'success', true,
+        'status',  'success',
+        'message', 'Data Found',
         'data', jsonb_build_object(
             'student_applicant_id', v_row.student_applicant_id,
             'card_number',          v_row.card_number,
             'is_verified',          v_row.is_verified,
             'registration_type',    v_row.registration_type
-        )
+        ) || attendance.nfc_card_labels(v_row.is_verified, v_row.registration_type)
     );
 END;
 $$;
+
+
+--
+-- Name: nfc_card_labels(smallint, smallint); Type: FUNCTION; Schema: attendance; Owner: -
+--
+
+CREATE FUNCTION attendance.nfc_card_labels(p_is_verified smallint, p_registration_type smallint) RETURNS jsonb
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE
+    AS $$
+    SELECT jsonb_build_object(
+        'is_verified_label', CASE p_is_verified
+                                 WHEN 1 THEN 'Verified'
+                                 WHEN 2 THEN 'Not Verified'
+                             END,
+        'registration_type_label', CASE p_registration_type
+                                       WHEN 1 THEN 'Admin'
+                                       WHEN 2 THEN 'Self'
+                                   END
+    )
+$$;
+
+
+--
+-- Name: FUNCTION nfc_card_labels(p_is_verified smallint, p_registration_type smallint); Type: COMMENT; Schema: attendance; Owner: -
+--
+
+COMMENT ON FUNCTION attendance.nfc_card_labels(p_is_verified smallint, p_registration_type smallint) IS 'is_verified 1=Verified 2=Not Verified; registration_type 1=Admin 2=Self.';
 
 
 --
@@ -116,6 +390,84 @@ $$;
 --
 
 COMMENT ON FUNCTION attendance.nfc_card_normalize(p_card_number character varying) IS 'Canonical card number: separators stripped, upper-cased, empty -> NULL.';
+
+
+--
+-- Name: nfc_card_reg_status(character varying); Type: FUNCTION; Schema: attendance; Owner: -
+--
+
+CREATE FUNCTION attendance.nfc_card_reg_status(p_registration_no character varying) RETURNS jsonb
+    LANGUAGE plpgsql STABLE
+    AS $$
+DECLARE
+    v_reg_no varchar := nullif(btrim(coalesce(p_registration_no, '')), '');
+    v_row    RECORD;
+BEGIN
+    IF v_reg_no IS NULL THEN
+        RETURN jsonb_build_object(
+            'status',  'error',
+            'code',    'missing_registration_no',
+            'message', 'registration_no is required',
+            'data',    '{}'::jsonb);
+    END IF;
+
+    -- `card_number IS NOT NULL` is part of the question, not a detail: a
+    -- student whose card was re-issued to someone else keeps their record —
+    -- images and all — with a NULL card number. They hold no card, so "is
+    -- their card registered?" is NO, and a desk told otherwise would refuse to
+    -- issue them one.
+    SELECT c.student_applicant_id, c.card_number, c.is_verified,
+           c.registration_type, c.card_image, c.student_selfie,
+           c.created_at, c.updated_at
+      INTO v_row
+      FROM attendance.nfc_student_cards c
+     WHERE c.student_applicant_id = v_reg_no
+       AND c.card_number IS NOT NULL;
+
+    -- Not an error in the domain sense — "not registered" is a perfectly good
+    -- answer to this question — but it is reported as one, because the agreed
+    -- contract pairs `status: "error"` with `data: {}` here. Match on `code`.
+    IF NOT FOUND THEN
+        RETURN jsonb_build_object(
+            'status',  'error',
+            'code',    'card_not_found',
+            'message', 'No Data Found',
+            'data',    '{}'::jsonb);
+    END IF;
+
+    RETURN jsonb_build_object(
+        'status',  'success',
+        'message', 'Registration found for registration no ' || v_row.student_applicant_id,
+        'data', jsonb_build_object(
+            'is_registered',        true,
+            'student_applicant_id', v_row.student_applicant_id,
+            -- Echoed under both names: `registration_no` is what the caller
+            -- asked with, `student_applicant_id` is what the other two
+            -- endpoints call the same value, and a client should not have to
+            -- know they are one column.
+            'registration_no',      v_row.student_applicant_id,
+            'card_number',          v_row.card_number,
+            'is_verified',          v_row.is_verified,
+            'registration_type',    v_row.registration_type,
+            -- Stored filesystem paths; the handler replaces both with public
+            -- URLs before answering.
+            'card_image',           v_row.card_image,
+            'student_selfie',       v_row.student_selfie,
+            -- When the registration was first created, and when it last
+            -- changed — what "already registered" is usually asked alongside.
+            'registered_at',        v_row.created_at,
+            'updated_at',           v_row.updated_at
+        ) || attendance.nfc_card_labels(v_row.is_verified, v_row.registration_type)
+    );
+END;
+$$;
+
+
+--
+-- Name: FUNCTION nfc_card_reg_status(p_registration_no character varying); Type: COMMENT; Schema: attendance; Owner: -
+--
+
+COMMENT ON FUNCTION attendance.nfc_card_reg_status(p_registration_no character varying) IS 'Does this registration no hold a registered card? Matched on student_applicant_id; whole row + is_registered on success; data is always an object, {} when not.';
 
 
 --
@@ -141,7 +493,7 @@ BEGIN
     -- ── Validation ───────────────────────────────────────────────────
     IF v_applicant = '' OR v_card IS NULL OR v_reg_type IS NULL THEN
         RETURN jsonb_build_object(
-            'success', false,
+            'status',  'error',
             'code',    'missing_fields',
             'message', 'student_applicant_id, card_number, and registration_type are required');
     END IF;
@@ -149,7 +501,7 @@ BEGIN
     IF v_reg_type NOT IN (1, 2)
        OR (p_is_verified IS NOT NULL AND p_is_verified NOT IN (1, 2)) THEN
         RETURN jsonb_build_object(
-            'success', false,
+            'status',  'error',
             'code',    'invalid_value',
             'message', 'is_verified/registration_type must be 1 or 2');
     END IF;
@@ -165,7 +517,7 @@ BEGIN
 
     IF length(v_applicant) > 64 THEN
         RETURN jsonb_build_object(
-            'success', false,
+            'status',  'error',
             'code',    'invalid_value',
             'message', 'student_applicant_id must be at most 64 characters');
     END IF;
@@ -175,7 +527,7 @@ BEGIN
     -- read (a one- or two-character "UID" is a failed scan, not a card).
     IF length(v_card) < 4 OR length(v_card) > 64 THEN
         RETURN jsonb_build_object(
-            'success', false,
+            'status',  'error',
             'code',    'invalid_card_number',
             'message', 'card_number must be 4-64 alphanumeric characters after normalization');
     END IF;
@@ -199,7 +551,7 @@ BEGIN
     IF v_holder.id IS NOT NULL AND v_holder.student_applicant_id <> v_applicant THEN
         IF NOT v_force THEN
             RETURN jsonb_build_object(
-                'success', false,
+                'status',  'error',
                 'code',    'card_conflict',
                 'message', 'Card already assigned to another student',
                 'data', jsonb_build_object(
@@ -274,7 +626,7 @@ BEGIN
             v_changed, p_performed_by, p_client_ip);
 
     RETURN jsonb_build_object(
-        'success', true,
+        'status',  'success',
         'message', 'Card info saved successfully',
         'data', jsonb_build_object(
             'student_applicant_id', v_row.student_applicant_id,
@@ -288,7 +640,7 @@ BEGIN
             'created',              v_created,
             'reassigned_from',      v_reassigned,
             'changed_fields',       to_jsonb(v_changed)
-        ),
+        ) || attendance.nfc_card_labels(v_row.is_verified, v_row.registration_type),
         'warnings', (
             SELECT COALESCE(jsonb_agg(w), '[]'::jsonb) FROM (
                 SELECT 'is_verified forced to 2 — a self-registration (registration_type=2) '
@@ -307,7 +659,7 @@ EXCEPTION
     -- the check, not as a 500.
     WHEN unique_violation THEN
         RETURN jsonb_build_object(
-            'success', false,
+            'status',  'error',
             'code',    'card_conflict',
             'message', 'Card already assigned to another student');
 END;
@@ -991,6 +1343,43 @@ SET default_tablespace = '';
 SET default_table_access_method = heap;
 
 --
+-- Name: app_users; Type: TABLE; Schema: attendance; Owner: -
+--
+
+CREATE TABLE attendance.app_users (
+    id integer NOT NULL,
+    person_id bigint NOT NULL,
+    username text,
+    du_base_role text,
+    role_id integer,
+    status text DEFAULT 'active'::text NOT NULL,
+    last_login_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE app_users; Type: COMMENT; Schema: attendance; Owner: -
+--
+
+COMMENT ON TABLE attendance.app_users IS 'Sign-in accounts. person_id = the bearer token''s `sub`. Copied from ictcell.app_users; carries DU email addresses.';
+
+
+--
+-- Name: app_users_id_seq; Type: SEQUENCE; Schema: attendance; Owner: -
+--
+
+ALTER TABLE attendance.app_users ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME attendance.app_users_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
 -- Name: body_building_mapping; Type: TABLE; Schema: attendance; Owner: -
 --
 
@@ -1086,6 +1475,214 @@ COMMENT ON VIEW attendance.employees IS 'Read-only projection of ictcell.employe
 
 
 --
+-- Name: ext_api_access_audit; Type: TABLE; Schema: attendance; Owner: -
+--
+
+CREATE TABLE attendance.ext_api_access_audit (
+    id bigint NOT NULL,
+    person_id bigint,
+    endpoint character varying(255) NOT NULL,
+    reason text NOT NULL,
+    token_source text,
+    rule_enforces boolean DEFAULT false NOT NULL,
+    refused boolean DEFAULT false NOT NULL,
+    hits bigint DEFAULT 1 NOT NULL,
+    first_seen timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE ext_api_access_audit; Type: COMMENT; Schema: attendance; Owner: -
+--
+
+COMMENT ON TABLE attendance.ext_api_access_audit IS 'Would-be and actual access refusals, folded by (person, endpoint, reason). Written by ExtAuthMiddleware; read during the enforcement rollout.';
+
+
+--
+-- Name: ext_api_access_audit_id_seq; Type: SEQUENCE; Schema: attendance; Owner: -
+--
+
+CREATE SEQUENCE attendance.ext_api_access_audit_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: ext_api_access_audit_id_seq; Type: SEQUENCE OWNED BY; Schema: attendance; Owner: -
+--
+
+ALTER SEQUENCE attendance.ext_api_access_audit_id_seq OWNED BY attendance.ext_api_access_audit.id;
+
+
+--
+-- Name: ext_api_allowed_ips; Type: TABLE; Schema: attendance; Owner: -
+--
+
+CREATE TABLE attendance.ext_api_allowed_ips (
+    id integer NOT NULL,
+    endpoint character varying(255) NOT NULL,
+    ip_address text[] DEFAULT '{}'::text[] NOT NULL,
+    is_active boolean DEFAULT true NOT NULL
+);
+
+
+--
+-- Name: TABLE ext_api_allowed_ips; Type: COMMENT; Schema: attendance; Owner: -
+--
+
+COMMENT ON TABLE attendance.ext_api_allowed_ips IS 'Per-endpoint IP allow-list read by ExtAuthMiddleware on every /ext-api call. This service''s copy; duerp-api keeps its own in ictcell.';
+
+
+--
+-- Name: ext_api_allowed_ips_id_seq; Type: SEQUENCE; Schema: attendance; Owner: -
+--
+
+CREATE SEQUENCE attendance.ext_api_allowed_ips_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: ext_api_allowed_ips_id_seq; Type: SEQUENCE OWNED BY; Schema: attendance; Owner: -
+--
+
+ALTER SEQUENCE attendance.ext_api_allowed_ips_id_seq OWNED BY attendance.ext_api_allowed_ips.id;
+
+
+--
+-- Name: ext_api_call_logs; Type: TABLE; Schema: attendance; Owner: -
+--
+
+CREATE TABLE attendance.ext_api_call_logs (
+    id bigint NOT NULL,
+    endpoint character varying(255) NOT NULL,
+    method character varying(10) NOT NULL,
+    request_body jsonb,
+    response_body jsonb,
+    status_code smallint NOT NULL,
+    duration_ms integer NOT NULL,
+    client_ip character varying(45),
+    user_agent text,
+    error_message text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE ext_api_call_logs; Type: COMMENT; Schema: attendance; Owner: -
+--
+
+COMMENT ON TABLE attendance.ext_api_call_logs IS 'Request/response log appended by ApiLogger for /ext-api calls. This service''s copy; duerp-api keeps its own in ictcell.';
+
+
+--
+-- Name: ext_api_call_logs_id_seq; Type: SEQUENCE; Schema: attendance; Owner: -
+--
+
+CREATE SEQUENCE attendance.ext_api_call_logs_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: ext_api_call_logs_id_seq; Type: SEQUENCE OWNED BY; Schema: attendance; Owner: -
+--
+
+ALTER SEQUENCE attendance.ext_api_call_logs_id_seq OWNED BY attendance.ext_api_call_logs.id;
+
+
+--
+-- Name: ext_api_endpoint_permissions; Type: TABLE; Schema: attendance; Owner: -
+--
+
+CREATE TABLE attendance.ext_api_endpoint_permissions (
+    id bigint NOT NULL,
+    endpoint character varying(255) NOT NULL,
+    resource_key text,
+    enforce boolean DEFAULT false NOT NULL,
+    is_active boolean DEFAULT true NOT NULL,
+    note text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE ext_api_endpoint_permissions; Type: COMMENT; Schema: attendance; Owner: -
+--
+
+COMMENT ON TABLE attendance.ext_api_endpoint_permissions IS 'Which attendance.resources key each /ext-api path requires. enforce=false means audit-only. No row = denied, once the middleware asks.';
+
+
+--
+-- Name: ext_api_endpoint_permissions_id_seq; Type: SEQUENCE; Schema: attendance; Owner: -
+--
+
+CREATE SEQUENCE attendance.ext_api_endpoint_permissions_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: ext_api_endpoint_permissions_id_seq; Type: SEQUENCE OWNED BY; Schema: attendance; Owner: -
+--
+
+ALTER SEQUENCE attendance.ext_api_endpoint_permissions_id_seq OWNED BY attendance.ext_api_endpoint_permissions.id;
+
+
+--
+-- Name: menu_items; Type: TABLE; Schema: attendance; Owner: -
+--
+
+CREATE TABLE attendance.menu_items (
+    id integer NOT NULL,
+    parent_id integer,
+    label text NOT NULL,
+    icon text,
+    route text,
+    resource_id integer,
+    sort_order integer DEFAULT 0 NOT NULL,
+    is_active boolean DEFAULT true NOT NULL,
+    platforms text[] DEFAULT '{desktop}'::text[] NOT NULL
+);
+
+
+--
+-- Name: COLUMN menu_items.platforms; Type: COMMENT; Schema: attendance; Owner: -
+--
+
+COMMENT ON COLUMN attendance.menu_items.platforms IS 'Which clients render this item: desktop | mobile | kiosk. Read by attendance.access_profile().';
+
+
+--
+-- Name: menu_items_id_seq; Type: SEQUENCE; Schema: attendance; Owner: -
+--
+
+ALTER TABLE attendance.menu_items ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME attendance.menu_items_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
 -- Name: nfc_card_audit; Type: TABLE; Schema: attendance; Owner: -
 --
 
@@ -1166,6 +1763,96 @@ CREATE SEQUENCE attendance.nfc_student_cards_id_seq
 --
 
 ALTER SEQUENCE attendance.nfc_student_cards_id_seq OWNED BY attendance.nfc_student_cards.id;
+
+
+--
+-- Name: resources; Type: TABLE; Schema: attendance; Owner: -
+--
+
+CREATE TABLE attendance.resources (
+    id integer NOT NULL,
+    key text NOT NULL,
+    name text NOT NULL,
+    category text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE resources; Type: COMMENT; Schema: attendance; Owner: -
+--
+
+COMMENT ON TABLE attendance.resources IS 'Permission keys ("nfc.card.register"). The shared vocabulary for menus, features and endpoint rules.';
+
+
+--
+-- Name: resources_id_seq; Type: SEQUENCE; Schema: attendance; Owner: -
+--
+
+ALTER TABLE attendance.resources ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME attendance.resources_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
+-- Name: role_permissions; Type: TABLE; Schema: attendance; Owner: -
+--
+
+CREATE TABLE attendance.role_permissions (
+    role_id integer NOT NULL,
+    resource_id integer NOT NULL
+);
+
+
+--
+-- Name: roles; Type: TABLE; Schema: attendance; Owner: -
+--
+
+CREATE TABLE attendance.roles (
+    id integer NOT NULL,
+    key text NOT NULL,
+    name text NOT NULL,
+    is_system boolean DEFAULT false NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE roles; Type: COMMENT; Schema: attendance; Owner: -
+--
+
+COMMENT ON TABLE attendance.roles IS 'Named roles. Copied from ictcell.roles; this service reads THIS copy. See docs/access_control.md.';
+
+
+--
+-- Name: roles_id_seq; Type: SEQUENCE; Schema: attendance; Owner: -
+--
+
+ALTER TABLE attendance.roles ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME attendance.roles_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
+-- Name: user_permission_overrides; Type: TABLE; Schema: attendance; Owner: -
+--
+
+CREATE TABLE attendance.user_permission_overrides (
+    user_id integer NOT NULL,
+    resource_id integer NOT NULL,
+    effect text NOT NULL,
+    CONSTRAINT user_permission_overrides_effect_check CHECK ((effect = ANY (ARRAY['grant'::text, 'deny'::text])))
+);
 
 
 --
@@ -1263,6 +1950,34 @@ ALTER TABLE ONLY attendance.buildings ALTER COLUMN id SET DEFAULT nextval('atten
 
 
 --
+-- Name: ext_api_access_audit id; Type: DEFAULT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.ext_api_access_audit ALTER COLUMN id SET DEFAULT nextval('attendance.ext_api_access_audit_id_seq'::regclass);
+
+
+--
+-- Name: ext_api_allowed_ips id; Type: DEFAULT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.ext_api_allowed_ips ALTER COLUMN id SET DEFAULT nextval('attendance.ext_api_allowed_ips_id_seq'::regclass);
+
+
+--
+-- Name: ext_api_call_logs id; Type: DEFAULT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.ext_api_call_logs ALTER COLUMN id SET DEFAULT nextval('attendance.ext_api_call_logs_id_seq'::regclass);
+
+
+--
+-- Name: ext_api_endpoint_permissions id; Type: DEFAULT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.ext_api_endpoint_permissions ALTER COLUMN id SET DEFAULT nextval('attendance.ext_api_endpoint_permissions_id_seq'::regclass);
+
+
+--
 -- Name: nfc_card_audit id; Type: DEFAULT; Schema: attendance; Owner: -
 --
 
@@ -1281,6 +1996,22 @@ ALTER TABLE ONLY attendance.nfc_student_cards ALTER COLUMN id SET DEFAULT nextva
 --
 
 ALTER TABLE ONLY attendance.wow_attendance_token_mismatch_record ALTER COLUMN id SET DEFAULT nextval('attendance.wow_attendance_token_mismatch_record_id_seq'::regclass);
+
+
+--
+-- Name: app_users app_users_person_id_key; Type: CONSTRAINT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.app_users
+    ADD CONSTRAINT app_users_person_id_key UNIQUE (person_id);
+
+
+--
+-- Name: app_users app_users_pkey; Type: CONSTRAINT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.app_users
+    ADD CONSTRAINT app_users_pkey PRIMARY KEY (id);
 
 
 --
@@ -1305,6 +2036,62 @@ ALTER TABLE ONLY attendance.body_building_mapping
 
 ALTER TABLE ONLY attendance.buildings
     ADD CONSTRAINT buildings_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: ext_api_access_audit ext_api_access_audit_pkey; Type: CONSTRAINT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.ext_api_access_audit
+    ADD CONSTRAINT ext_api_access_audit_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: ext_api_access_audit ext_api_access_audit_uq; Type: CONSTRAINT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.ext_api_access_audit
+    ADD CONSTRAINT ext_api_access_audit_uq UNIQUE NULLS NOT DISTINCT (person_id, endpoint, reason);
+
+
+--
+-- Name: ext_api_allowed_ips ext_api_allowed_ips_pkey; Type: CONSTRAINT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.ext_api_allowed_ips
+    ADD CONSTRAINT ext_api_allowed_ips_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: ext_api_call_logs ext_api_call_logs_pkey; Type: CONSTRAINT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.ext_api_call_logs
+    ADD CONSTRAINT ext_api_call_logs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: ext_api_endpoint_permissions ext_api_endpoint_permissions_endpoint_uq; Type: CONSTRAINT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.ext_api_endpoint_permissions
+    ADD CONSTRAINT ext_api_endpoint_permissions_endpoint_uq UNIQUE (endpoint);
+
+
+--
+-- Name: ext_api_endpoint_permissions ext_api_endpoint_permissions_pkey; Type: CONSTRAINT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.ext_api_endpoint_permissions
+    ADD CONSTRAINT ext_api_endpoint_permissions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: menu_items menu_items_pkey; Type: CONSTRAINT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.menu_items
+    ADD CONSTRAINT menu_items_pkey PRIMARY KEY (id);
 
 
 --
@@ -1337,6 +2124,54 @@ ALTER TABLE ONLY attendance.nfc_student_cards
 
 ALTER TABLE ONLY attendance.nfc_student_cards
     ADD CONSTRAINT nfc_student_cards_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: resources resources_key_key; Type: CONSTRAINT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.resources
+    ADD CONSTRAINT resources_key_key UNIQUE (key);
+
+
+--
+-- Name: resources resources_pkey; Type: CONSTRAINT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.resources
+    ADD CONSTRAINT resources_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: role_permissions role_permissions_pkey; Type: CONSTRAINT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.role_permissions
+    ADD CONSTRAINT role_permissions_pkey PRIMARY KEY (role_id, resource_id);
+
+
+--
+-- Name: roles roles_key_key; Type: CONSTRAINT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.roles
+    ADD CONSTRAINT roles_key_key UNIQUE (key);
+
+
+--
+-- Name: roles roles_pkey; Type: CONSTRAINT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.roles
+    ADD CONSTRAINT roles_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: user_permission_overrides user_permission_overrides_pkey; Type: CONSTRAINT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.user_permission_overrides
+    ADD CONSTRAINT user_permission_overrides_pkey PRIMARY KEY (user_id, resource_id);
 
 
 --
@@ -1379,6 +2214,41 @@ CREATE INDEX body_building_mapping_body_active_idx ON attendance.body_building_m
 
 
 --
+-- Name: ext_api_access_audit_endpoint_idx; Type: INDEX; Schema: attendance; Owner: -
+--
+
+CREATE INDEX ext_api_access_audit_endpoint_idx ON attendance.ext_api_access_audit USING btree (endpoint, last_seen DESC);
+
+
+--
+-- Name: ext_api_allowed_ips_endpoint_active_idx; Type: INDEX; Schema: attendance; Owner: -
+--
+
+CREATE INDEX ext_api_allowed_ips_endpoint_active_idx ON attendance.ext_api_allowed_ips USING btree (endpoint) WHERE is_active;
+
+
+--
+-- Name: ext_api_call_logs_created_idx; Type: INDEX; Schema: attendance; Owner: -
+--
+
+CREATE INDEX ext_api_call_logs_created_idx ON attendance.ext_api_call_logs USING btree (created_at DESC);
+
+
+--
+-- Name: ext_api_call_logs_endpoint_status_idx; Type: INDEX; Schema: attendance; Owner: -
+--
+
+CREATE INDEX ext_api_call_logs_endpoint_status_idx ON attendance.ext_api_call_logs USING btree (endpoint, status_code);
+
+
+--
+-- Name: ext_api_endpoint_permissions_active_idx; Type: INDEX; Schema: attendance; Owner: -
+--
+
+CREATE INDEX ext_api_endpoint_permissions_active_idx ON attendance.ext_api_endpoint_permissions USING btree (endpoint) WHERE is_active;
+
+
+--
 -- Name: nfc_card_audit_applicant_idx; Type: INDEX; Schema: attendance; Owner: -
 --
 
@@ -1407,6 +2277,14 @@ CREATE INDEX wow_attendance_token_mismatch_user_idx ON attendance.wow_attendance
 
 
 --
+-- Name: app_users app_users_role_id_fkey; Type: FK CONSTRAINT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.app_users
+    ADD CONSTRAINT app_users_role_id_fkey FOREIGN KEY (role_id) REFERENCES attendance.roles(id);
+
+
+--
 -- Name: body_building_mapping body_building_mapping_building_id_fkey; Type: FK CONSTRAINT; Schema: attendance; Owner: -
 --
 
@@ -1415,11 +2293,59 @@ ALTER TABLE ONLY attendance.body_building_mapping
 
 
 --
+-- Name: menu_items menu_items_parent_id_fkey; Type: FK CONSTRAINT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.menu_items
+    ADD CONSTRAINT menu_items_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES attendance.menu_items(id) ON DELETE CASCADE;
+
+
+--
+-- Name: menu_items menu_items_resource_id_fkey; Type: FK CONSTRAINT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.menu_items
+    ADD CONSTRAINT menu_items_resource_id_fkey FOREIGN KEY (resource_id) REFERENCES attendance.resources(id);
+
+
+--
 -- Name: nfc_card_audit nfc_card_audit_card_id_fkey; Type: FK CONSTRAINT; Schema: attendance; Owner: -
 --
 
 ALTER TABLE ONLY attendance.nfc_card_audit
     ADD CONSTRAINT nfc_card_audit_card_id_fkey FOREIGN KEY (card_id) REFERENCES attendance.nfc_student_cards(id) ON DELETE SET NULL;
+
+
+--
+-- Name: role_permissions role_permissions_resource_id_fkey; Type: FK CONSTRAINT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.role_permissions
+    ADD CONSTRAINT role_permissions_resource_id_fkey FOREIGN KEY (resource_id) REFERENCES attendance.resources(id) ON DELETE CASCADE;
+
+
+--
+-- Name: role_permissions role_permissions_role_id_fkey; Type: FK CONSTRAINT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.role_permissions
+    ADD CONSTRAINT role_permissions_role_id_fkey FOREIGN KEY (role_id) REFERENCES attendance.roles(id) ON DELETE CASCADE;
+
+
+--
+-- Name: user_permission_overrides user_permission_overrides_resource_id_fkey; Type: FK CONSTRAINT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.user_permission_overrides
+    ADD CONSTRAINT user_permission_overrides_resource_id_fkey FOREIGN KEY (resource_id) REFERENCES attendance.resources(id) ON DELETE CASCADE;
+
+
+--
+-- Name: user_permission_overrides user_permission_overrides_user_id_fkey; Type: FK CONSTRAINT; Schema: attendance; Owner: -
+--
+
+ALTER TABLE ONLY attendance.user_permission_overrides
+    ADD CONSTRAINT user_permission_overrides_user_id_fkey FOREIGN KEY (user_id) REFERENCES attendance.app_users(id) ON DELETE CASCADE;
 
 
 --
@@ -1450,5 +2376,5 @@ ALTER TABLE ONLY attendance.wow_attendance_records
 -- PostgreSQL database dump complete
 --
 
-\unrestrict D2EIuEMrvhhVOppUV6GKb5TQt3Ks8JZEYWoLlyGHbyZxhtNZzj751Mr7hngiDHS
+\unrestrict fg7wyKIgtEvQlw0uy4Rp9kqbdBU1yVgdyEz5xqF8zYuwmrppHJsNzRBQrRXpX5J
 

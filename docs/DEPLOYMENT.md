@@ -52,8 +52,10 @@ infrastructure still lives in `ictcell`.
 #    already created it.
 psql "$DATABASE_URL" -f sql/000_ext_api_infra.sql
 
-# 2. everything this service owns: 8 tables, the attendance.employees view
-#    and 14 functions, all under the `attendance` schema.
+# 2. everything this service owns: 15 tables, the attendance.employees view
+#    and 17 functions, all under the `attendance` schema. (7 of those tables
+#    and the last 2 functions are the access-control layer — created EMPTY,
+#    and read by nothing until the middleware ships; see access_control.md.)
 psql "$DATABASE_URL" -v app_role=duerp_attendance \
      -f docs/attendance_schema.sql
 ```
@@ -71,6 +73,20 @@ and is the incremental migration for the NFC card module, for an existing
 deployment that does not want to re-run the whole schema file. Its objects are
 already in `docs/attendance_schema.sql` (section 5), so step 2 above covers a
 fresh deployment on its own. See [`nfc_card.md`](nfc_card.md).
+
+`sql/006_access_control.sql` is optional, and it is what fills the
+access-control tables section 6 of the schema file creates empty. It copies the
+ERP's RBAC rows — roles, resources, accounts, role grants, per-person overrides
+and menu items — out of `ictcell` into `attendance`, ids preserved, then seeds
+one rule per endpoint in **audit mode** (`enforce = false`). Applying it refuses
+nothing, and the service does not read any of it yet.
+
+It **reads** `ictcell` and never writes to it; the ERP's own tables are left
+exactly as they are. The flip side is the thing to decide before going further:
+the ERP's admin screens keep writing `ictcell`, so a role assigned there no
+longer reaches this service. §9 of that file has the three ways to resolve it
+(point the ERP at `attendance`, re-sync on a schedule, or administer roles
+here). Design and rollout: [`access_control.md`](access_control.md).
 
 Cutting over a database that already ran the `ictcell` version needs the data
 copied across as well — the commented appendix at the end of
@@ -139,6 +155,29 @@ interchangeable:
 
 The first two moved out of duerp-api on 2026-08-19; `WOW_LOG_DIR` did not.
 
+### Access control (per-person permissions)
+
+Two keys, both safe to leave at their defaults — together they are why a
+deployment carrying this code refuses nothing until somebody decides otherwise:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `EXT_ACCESS_CONTROL` | `audit` | `off` = never ask. `audit` = ask on every `/ext-api` request, record the verdict, serve it anyway. `on` = also refuse, but only where a rule row says `enforce = true`. Anything unrecognised is `audit`. |
+| `EXT_ACCESS_FAIL_CLOSED` | `false` | Whether a *failed* check (unapplied migration, database down) refuses. `false` means a binary deployed ahead of `sql/006_access_control.sql` behaves exactly as today. |
+
+The evidence the rollout is read from lands in
+`attendance.ext_api_access_audit` (one row per person/endpoint/reason, with a
+hit counter) and in the service log, greppable on `[access]`:
+
+```bash
+journalctl -u duerp-attendance | grep '\[access\]' | tail
+```
+
+**Before `on`:** every `app_users.role_id` is NULL until backfilled, so
+enforcing today denies everybody — and `WOW_ACCEPT_DU_TOKEN` must be `false`
+first, or a forged token can claim any identity. Both are covered in
+[`access_control.md`](access_control.md#7--preconditions--read-this-before-enabling-anything).
+
 ### The face-match service (NFC saves depend on it)
 
 `POST /ext-api/nfc-card/save_card_info` sends the card photo and the selfie to
@@ -204,6 +243,19 @@ Both take `page`, `limit`, `person_id`, `from_date`, `to_date` as query params
 and return a listing; add `file=<name>` to read one file's content. The
 requested name is matched against the directory's own listing before it is
 opened, so a path outside the folder cannot be reached by naming it.
+
+**A `person_id` ending in `-2`, `-3`, …** is not a different person. Files are
+named `{id}_{timestamp}.log` to the second, and when one id makes two calls
+inside one second the second file is suffixed (`2017001010-2_…`) so it cannot
+overwrite the first — which is what used to happen. Filtering is a substring
+match, so a search for the bare id still returns them all.
+
+> **duerp-api has its own copy of the writer** (`src/utils/step_logger.rs`,
+> which the two services are supposed to keep identical) and it **still
+> overwrites**. The readers need no change — the suffix goes on the id, so the
+> five trailing timestamp segments both parsers split on are untouched — but
+> the fix itself has to be ported, or duerp-api keeps losing a log every time a
+> client retries within the same second.
 
 Do not "simplify" this by dropping the `/uploads/log` blocks and letting the
 static route serve the folder. The files carry usernames, client IPs, GPS,
@@ -364,6 +416,42 @@ server {
         proxy_read_timeout  120s;
         proxy_send_timeout  120s;
         proxy_request_buffering off;
+    }
+
+    # This service serves THREE prefixes under /ext-api, not one. A prefix with
+    # no block here falls through to `location /` and never reaches :8083 —
+    # which surfaces as a 404 or an SPA page rather than an API error, and is
+    # the first thing to check when a brand-new endpoint "does not exist".
+    #
+    # If the NFC endpoints already work in production, the live config has
+    # something this document did not, and these are the blocks it is missing.
+    location /ext-api/nfc-card/ {
+        proxy_pass http://127.0.0.1:8083;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # save_card_info uploads two images and waits on the face-match
+        # service (NFC_FACE_VERIFY_TIMEOUT_SECS, default 30s).
+        proxy_read_timeout  120s;
+        proxy_send_timeout  120s;
+        proxy_request_buffering off;
+    }
+
+    # Exact match, not a prefix: /ext-api/me/access is the only path here, and
+    # it is the one every client calls at login and on every app foreground.
+    location = /ext-api/me/access {
+        proxy_pass http://127.0.0.1:8083;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Small JSON, no uploads — the defaults are fine. Do NOT add a cache
+        # here: the response is per-person, and the endpoint does its own
+        # revalidation with an ETag.
+        proxy_read_timeout  30s;
     }
 
     # ---- 5. login stays on duerp-api -------------------------------------

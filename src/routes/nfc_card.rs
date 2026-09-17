@@ -485,12 +485,13 @@ pub struct GetCardInfoQuery {
 /// outright on the others.
 ///
 /// `field` is the parameter to look for — `card_number` for the scan lookup,
-/// `registration_no` for the registration-status check. One parser for both, so
-/// the two cannot drift into accepting different encodings.
+/// `registration_no` for the registration-status check, `platform` for the
+/// access profile. One parser for all of them, so they cannot drift into
+/// accepting different encodings.
 ///
 /// Returns `None` for a GET (no body), an empty body, or a body with no such
 /// field — the caller then falls back to the query string.
-fn scalar_from_body(content_type: &str, body: &[u8], field: &str) -> Option<String> {
+pub(crate) fn scalar_from_body(content_type: &str, body: &[u8], field: &str) -> Option<String> {
     if body.is_empty() {
         return None;
     }
@@ -758,6 +759,20 @@ fn parse_flag(raw: Option<&str>) -> Result<Option<i16>, ()> {
         Some(s) => s.parse::<i16>().map(Some).map_err(|_| ()),
     }
 }
+
+/// The permission point for `force_reassign`, checked in the handler.
+///
+/// NOT a request path — no URL ends in `#force_reassign`, and the middleware
+/// (which matches on `req.path()`) can never hit this row. It is a permission
+/// point: a decision inside the request that the path cannot express, because
+/// taking a card off another student is a different thing from registering one
+/// and must be grantable separately.
+///
+/// **This string must match the row seeded by `sql/006_access_control.sql` §8**
+/// — a typo here means `no_rule`, which fails closed and refuses every
+/// reassignment once the rule is enforced. `tests/access_control_sql.rs` pins
+/// the seeded row; the two are compared by eye, so change them together.
+const REASSIGN_POINT: &str = "/ext-api/nfc-card/save_card_info#force_reassign";
 
 /// `force_reassign` accepts the spellings a form post actually produces —
 /// `true`, `1`, `yes`, `on` — because a checkbox serialises as `on` and a JSON
@@ -1060,6 +1075,50 @@ async fn nfc_save_card_info_inner(
         ));
     }
 
+    // ── May this caller reassign a card? ─────────────────────────────
+    // `force_reassign` takes a card off the student who currently holds it —
+    // the most dangerous thing this service does, and a FIELD rather than a
+    // path, so the endpoint→permission map cannot express it (see
+    // `REASSIGN_POINT` and docs/access_control.md §5).
+    //
+    // Checked here, before the face-match gate, because that gate is an HTTP
+    // round trip to another service: a caller who may not reassign should not
+    // wait on it, and should not occupy it. The uploaded files are already on
+    // disk by now — the multipart body has been read — and stay there,
+    // referenced by nothing, exactly like every other rejected upload here.
+    //
+    // Same two switches as everything else: in `audit` mode this records the
+    // would-be refusal and lets the save proceed, so turning the permission on
+    // cannot surprise a card desk that has been reassigning all along.
+    let force_reassign = parse_bool(force_reassign_raw.as_deref());
+    if force_reassign {
+        let token_source = match crate::routes::wow_attendance::token_identity(req.headers()) {
+            Some((_, true)) => "legacy",
+            Some((_, false)) => "ours",
+            None => "none",
+        };
+        let decision = crate::middleware::ext_auth_middleware::access_decision(
+            &db,
+            Some(token_user_id),
+            token_source,
+            REASSIGN_POINT,
+        )
+        .await;
+
+        if !decision.allowed {
+            log.step(format!(
+                "caller lacks `nfc.card.reassign` (refused={}) — force_reassign requested by token user id={token_user_id}",
+                decision.refuse
+            ));
+        }
+        if decision.refuse {
+            return HttpResponse::Forbidden().json(fail(
+                "forbidden",
+                "You may register a card, but not reassign one already issued to another student",
+            ));
+        }
+    }
+
     // ── The face-match gate ──────────────────────────────────────────
     // Both photos are required on EVERY save, including one that only flips
     // `is_verified`: the pair is what the gate below compares, and a save that
@@ -1081,7 +1140,6 @@ async fn nfc_save_card_info_inner(
         return resp;
     }
 
-    let force_reassign = parse_bool(force_reassign_raw.as_deref());
     let stored_paths: Vec<&str> = [card_image.as_ref(), student_selfie.as_ref()]
         .iter()
         .flatten()
