@@ -285,7 +285,7 @@ The gate is an **admin setting**, not a deploy-time one:
 
 | | |
 |---|---|
-| **Screen** | `https://attendance.du.ac.bd/settings/face-verification` — "Face verification" in the admin nav |
+| **Screen** | `https://attendence.du.ac.bd/settings/face-verification` — "Face verification" in the admin nav |
 | **Read** | `GET /admin-api/settings/nfc-face-verify` → `{ "success": true, "data": { … } }` |
 | **Write** | `PUT /admin-api/settings/nfc-face-verify` → `{ "nfc_face_verify": "ON"\|"OFF", "nfc_face_verify_url": "https://…" }` |
 

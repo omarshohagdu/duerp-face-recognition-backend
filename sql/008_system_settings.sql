@@ -320,11 +320,18 @@ ON CONFLICT DO NOTHING;
 -- Seeded `enforce = true`, like the other admin API (sql/007): these endpoints
 -- have no existing callers to break, and an unenforced switch for disabling
 -- face verification is worse than no switch.
+-- TWO PATHS, one endpoint. The handlers are mounted under both `/ext-api` and
+-- `/admin-api` (src/main.rs): the second is the documented contract, the first
+-- is the one the production gateway actually proxies today. The middleware
+-- matches on the exact path, so each needs its own row, and they carry the
+-- same permission because they are the same capability.
 INSERT INTO attendance.ext_api_endpoint_permissions (endpoint, resource_key, enforce, note)
 SELECT v.endpoint, 'admin.settings.manage', true, v.note
   FROM (VALUES
     ('/admin-api/settings/nfc-face-verify',
-     'GET reads the face-verification toggle; PUT changes it. Both methods, one row — the allow-list and this map key on path, not method.')
+     'GET reads the face-verification toggle; PUT changes it. Both methods, one row — the allow-list and this map key on path, not method.'),
+    ('/ext-api/settings/nfc-face-verify',
+     'The same endpoint under the prefix the gateway proxies. Remove this row only once /admin-api has a proxy rule AND every client has moved.')
   ) AS v(endpoint, note)
  WHERE NOT EXISTS (
     SELECT 1 FROM attendance.ext_api_endpoint_permissions p WHERE p.endpoint = v.endpoint
@@ -334,8 +341,11 @@ SELECT v.endpoint, 'admin.settings.manage', true, v.note
 -- (see src/main.rs), so this path needs its allow-list row or it is a 403
 -- before the handler runs.
 INSERT INTO attendance.ext_api_allowed_ips (endpoint, ip_address)
-SELECT '/admin-api/settings/nfc-face-verify', '{*}'::text[]
+SELECT v.endpoint, '{*}'::text[]
+  FROM (VALUES
+    ('/admin-api/settings/nfc-face-verify'),
+    ('/ext-api/settings/nfc-face-verify')
+  ) AS v(endpoint)
  WHERE NOT EXISTS (
-    SELECT 1 FROM attendance.ext_api_allowed_ips a
-     WHERE a.endpoint = '/admin-api/settings/nfc-face-verify'
+    SELECT 1 FROM attendance.ext_api_allowed_ips a WHERE a.endpoint = v.endpoint
  );

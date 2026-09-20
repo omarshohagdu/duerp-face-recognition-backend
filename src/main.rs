@@ -198,6 +198,18 @@ async fn main() -> std::io::Result<()> {
                     .service(routes::access_admin::users_list)     // POST /ext-api/access/users?search=&limit=&offset=
                     .service(routes::access_admin::user_role)      // POST /ext-api/access/user-role     (json: person_id, role|null)
                     .service(routes::access_admin::user_override)  // POST /ext-api/access/user-override (json: person_id, permission, effect)
+                    // The settings API, mounted here as well as under
+                    // /admin-api. The production gateway proxies /ext-api/ as a
+                    // prefix but has no rule for /admin-api, so this is the
+                    // path that actually reaches the service from a browser
+                    // today; the other one works the moment that rule lands.
+                    // Both paths have their own allow-list and permission rows.
+                    .app_data(
+                        web::JsonConfig::default()
+                            .error_handler(routes::settings::json_error_handler),
+                    )
+                    .service(routes::settings::get_nfc_face_verify) // GET /ext-api/settings/nfc-face-verify
+                    .service(routes::settings::put_nfc_face_verify) // PUT /ext-api/settings/nfc-face-verify
             )
             // Admin-managed runtime settings. A SEPARATE scope because the
             // admin panel asked for this path — but wrapped in the SAME gate,

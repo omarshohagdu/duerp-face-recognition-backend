@@ -379,21 +379,21 @@ the attendance API and face images to `:8083`, and forwards only `POST /login`
 to duerp-api on `:8080`.
 
 ```nginx
-# /etc/nginx/sites-available/attendance.du.ac.bd
+# /etc/nginx/sites-available/attendence.du.ac.bd
 
 server {
     listen 80;
-    server_name attendance.du.ac.bd;
+    server_name attendence.du.ac.bd;
     return 301 https://$host$request_uri;
 }
 
 server {
     listen 443 ssl;
     http2 on;
-    server_name attendance.du.ac.bd;
+    server_name attendence.du.ac.bd;
 
-    ssl_certificate     /etc/letsencrypt/live/attendance.du.ac.bd/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/attendance.du.ac.bd/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/attendence.du.ac.bd/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/attendence.du.ac.bd/privkey.pem;
 
     # TLS is not optional here: getUserMedia and navigator.geolocation are both
     # disabled outside a secure context, so an expired certificate takes
@@ -429,7 +429,17 @@ server {
     }
 
     # ---- 4. attendance API ----------------------------------------------
-    location /ext-api/wow-attendance/ {
+    # ONE PREFIX RULE for everything this service serves under /ext-api —
+    # wow-attendance, nfc-card, access and me/access. Verified live on
+    # 2026-09-20: each of those paths answers `401 application/json`, which is
+    # the service's own auth layer, not nginx.
+    #
+    # This replaces the three per-path blocks this file used to show. They were
+    # wrong twice over: the live config already covers the whole prefix, and
+    # listing paths individually means every new endpoint needs an nginx change
+    # nobody remembers to make — which is exactly how /admin-api ended up
+    # unreachable.
+    location /ext-api/ {
         proxy_pass http://127.0.0.1:8083;
         proxy_set_header Host              $host;
         # Required: the ext-api IP allow-list reads this. Without it every
@@ -438,47 +448,32 @@ server {
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
 
-        # Image upload + AI round-trip. The service allows the AI platform 30s;
-        # keep this comfortably above it so nginx is never the one to give up
-        # on a request that actually succeeded.
+        # Sized for the uploading endpoints — enroll, verify and save_card_info
+        # each send images and wait on the AI or face-match service (30s
+        # server-side). Keep this comfortably above that so nginx is never the
+        # one to give up on a request that actually succeeded.
         proxy_read_timeout  120s;
         proxy_send_timeout  120s;
         proxy_request_buffering off;
     }
 
-    # This service serves THREE prefixes under /ext-api, not one. A prefix with
-    # no block here falls through to `location /` and never reaches :8083 —
-    # which surfaces as a 404 or an SPA page rather than an API error, and is
-    # the first thing to check when a brand-new endpoint "does not exist".
+    # ⚠ THE ONE RULE MISSING FROM THE LIVE CONFIG (2026-09-20). /ext-api/ above
+    # is there; this is not, so the admin settings screen is broken in the
+    # browser and nothing reaches the service: every "successful" /admin-api
+    # call in attendance.ext_api_call_logs came from curl on the box
+    # (client_ip 127.0.0.1), never from a browser.
     #
-    # If the NFC endpoints already work in production, the live config has
-    # something this document did not, and these are the blocks it is missing.
-    location /ext-api/nfc-card/ {
+    # `/admin-api` is a SEPARATE prefix from `/ext-api` (src/main.rs mounts two
+    # scopes), so the rule above does not cover it — the only reason it needs
+    # a block of its own.
+    location /admin-api/ {
         proxy_pass http://127.0.0.1:8083;
         proxy_set_header Host              $host;
+        # Without this the allow-list sees the proxy, not the caller — which is
+        # why the curl-only rows above logged 127.0.0.1.
         proxy_set_header X-Real-IP         $remote_addr;
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-
-        # save_card_info uploads two images and waits on the face-match
-        # service (NFC_FACE_VERIFY_TIMEOUT_SECS, default 30s).
-        proxy_read_timeout  120s;
-        proxy_send_timeout  120s;
-        proxy_request_buffering off;
-    }
-
-    # Exact match, not a prefix: /ext-api/me/access is the only path here, and
-    # it is the one every client calls at login and on every app foreground.
-    location = /ext-api/me/access {
-        proxy_pass http://127.0.0.1:8083;
-        proxy_set_header Host              $host;
-        proxy_set_header X-Real-IP         $remote_addr;
-        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-
-        # Small JSON, no uploads — the defaults are fine. Do NOT add a cache
-        # here: the response is per-person, and the endpoint does its own
-        # revalidation with an ETag.
         proxy_read_timeout  30s;
     }
 
@@ -516,14 +511,71 @@ server {
 ```
 
 ```bash
-sudo ln -s /etc/nginx/sites-available/attendance.du.ac.bd /etc/nginx/sites-enabled/
+sudo ln -s /etc/nginx/sites-available/attendence.du.ac.bd /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-`attendance.du.ac.bd` is the confirmed production hostname; the certificate is
-issued for it and `server_name` must match. If it ever moves, only this file
-and the certificate change — the frontend needs no rebuild, because the bundle
-uses relative URLs.
+`attendence.du.ac.bd` is the production hostname — **spelled that way on
+purpose.** `attendance.du.ac.bd`, with the ordinary spelling, does **not
+resolve**; everything before 2026-09-20 in this file said otherwise and was
+wrong, which cost an afternoon. Verify before you "fix" it:
+
+```bash
+getent hosts attendence.du.ac.bd   # 103.221.252.174
+getent hosts attendance.du.ac.bd   # nothing
+```
+
+The certificate is issued for the misspelled name and `server_name` must match
+it. If it ever moves, only this file and the certificate change — the frontend
+needs no rebuild, because the bundle uses relative URLs.
+
+### A path with no proxy rule
+
+**The first thing to check when a brand-new endpoint "does not exist".** This
+service serves three prefixes — `/ext-api/`, `/admin-api/` and `/uploads/` —
+each needing its own `location` block, and a prefix with no block does not 404
+honestly. It falls into
+`location /`, the SPA root, and you get:
+
+| Method | What comes back | Why it is confusing |
+|---|---|---|
+| `GET` | **`200` with `index.html`** | Looks like success. A client doing `res.json()` on it reports a JSON parse error, or renders an empty error box |
+| `PUT` / `DELETE` | **`405 Not Allowed`** — from nginx | Looks like the API rejected the method, but the API never saw the request |
+| `POST` | `405`, or `200` + `index.html` | Same |
+
+Two commands settle it in ten seconds — compare a known-good path with the
+suspect one:
+
+```bash
+curl -sk -o /dev/null -w '%{http_code} %{content_type}\n' \
+  -X POST https://attendence.du.ac.bd/ext-api/access/roles     # 200 application/json
+curl -sk -o /dev/null -w '%{http_code} %{content_type}\n' \
+  https://attendence.du.ac.bd/admin-api/settings/nfc-face-verify  # 200 text/html  ← no rule
+```
+
+`text/html` from an API path means nginx, not the service. Confirm from the
+other side with the service's own log — if the request never arrived, it is not
+there:
+
+```sql
+SELECT created_at, method, status_code, client_ip, left(user_agent, 30)
+  FROM attendance.ext_api_call_logs
+ WHERE endpoint LIKE '/admin-api/%' ORDER BY created_at DESC LIMIT 10;
+```
+
+**Check `client_ip` and `user_agent`, not just the status.** Rows from `curl`
+on the box (`127.0.0.1`) prove the *service* works; only a browser user agent
+with a real client IP proves the *proxy* does. Reading a wall of `200`s without
+that column is how this took a day to find.
+
+### Where the live config actually is
+
+Not on this box. nginx here listens on **:80 only** and serves unrelated
+vhosts (`local.db.com`, `local.college.com`); a `Host:`-spoofed request to it
+returns those, not this app. TLS for `attendence.du.ac.bd` terminates
+elsewhere, so the server block above is a **template for whoever owns that
+front end** — the `/ext-api/` rules there are live, the `/admin-api/` and
+`/ext-api/me/access` ones are not.
 
 ### Why this vhost and not a shared one
 
@@ -557,10 +609,11 @@ dedicated vhost it was most likely swallowed by rule 7 — the SPA catch-all
 returns `index.html` for anything unmatched, and an API client reading that as
 a failure reports a bare 404. Check, in order:
 
-1. The `location /ext-api/wow-attendance/ { … }` block is present and nginx was
-   reloaded (`nginx -t && systemctl reload nginx`).
-2. The trailing slash matches. `location /ext-api/wow-attendance/` does **not**
-   match a request for `/ext-api/wow-attendance` with no trailing segment.
+1. The `location /ext-api/ { … }` block is present and nginx was reloaded
+   (`nginx -t && systemctl reload nginx`). One prefix rule covers every path
+   under it; `/admin-api/` is a different prefix and needs its own.
+2. The trailing slash matches. `location /ext-api/` does **not** match a
+   request for `/ext-api` with no trailing segment.
 3. duerp-attendance is actually up — `curl -s localhost:8083/health`.
 4. You are hitting the vhost, not duerp-api. Postman's `{{url}}` variable
    pointing at the old host:port is the single most common cause; against the

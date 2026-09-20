@@ -37,9 +37,17 @@ use crate::routes::wow_attendance::{
 use crate::utils::settings;
 use crate::utils::step_logger::{query_to_json, StepLogger};
 
-/// The one path both methods live on; the allow-list and the permission map
-/// key on path, not method.
-const ENDPOINT: &str = "/admin-api/settings/nfc-face-verify";
+/// These handlers are mounted TWICE — under `/ext-api` and under `/admin-api`
+/// (see `main.rs`) — so the permission check reads the path off the request
+/// rather than a constant. Both paths carry their own `ext_api_allowed_ips`
+/// and `ext_api_endpoint_permissions` rows, pointing at the same permission,
+/// because the middleware matches on the exact path.
+///
+/// Why two: `/admin-api/settings/nfc-face-verify` is the documented contract,
+/// but the production gateway has no proxy rule for `/admin-api` and adding
+/// one is another team's change. `/ext-api/` is already proxied, so the same
+/// endpoint under that prefix works today. When the gateway rule lands, the
+/// documented path starts working with no further change.
 
 /// The permission. Its own rather than `admin.roles.manage`: turning face
 /// verification off is an operations decision, and the person who administers
@@ -89,7 +97,9 @@ async fn require_admin(
 
     let verdict = sqlx::query_scalar::<_, Value>("SELECT attendance.ext_api_can_call($1, $2)")
         .bind(person_id)
-        .bind(ENDPOINT)
+        // The path actually called, so this agrees with the rule row the
+        // middleware just evaluated for the same request.
+        .bind(req.path())
         .fetch_one(db.get_ref())
         .await;
 
