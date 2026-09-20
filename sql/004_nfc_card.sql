@@ -100,6 +100,12 @@ AS $function$
         'is_verified_label', CASE p_is_verified
                                  WHEN 1 THEN 'Verified'
                                  WHEN 2 THEN 'Not Verified'
+                                 -- Written by the service, never by a caller:
+                                 -- the save happened while the face gate was
+                                 -- OFF, so the two photographs were never
+                                 -- compared. Distinct from 2 on purpose — that
+                                 -- one means "checked, awaiting review".
+                                 WHEN 0 THEN 'Not Face-Checked'
                              END,
         'registration_type_label', CASE p_registration_type
                                        WHEN 1 THEN 'Admin'
@@ -109,7 +115,7 @@ AS $function$
 $function$;
 
 COMMENT ON FUNCTION attendance.nfc_card_labels(smallint, smallint) IS
-    'is_verified 1=Verified 2=Not Verified; registration_type 1=Admin 2=Self.';
+    'is_verified 0=Not Face-Checked 1=Verified 2=Not Verified; registration_type 1=Admin 2=Self.';
 
 -- ---------------------------------------------------------------------
 -- 2 · The mapping table
@@ -129,7 +135,10 @@ CREATE TABLE IF NOT EXISTS attendance.nfc_student_cards (
     -- baking it into rows would strand them behind a hostname change.
     card_image           text,
     student_selfie       text,
-    -- 1 = Yes, 2 = No.
+    -- 1 = Verified, 2 = Not Verified (checked, awaiting review),
+    -- 0 = Not Face-Checked — the save was made while the face gate was OFF.
+    -- 0 is set by the service, never accepted from a caller: it is a statement
+    -- about what this service did, not a claim the desk gets to make.
     is_verified          smallint    NOT NULL DEFAULT 2,
     -- 1 = Admin, 2 = Self.
     registration_type    smallint    NOT NULL,
@@ -144,13 +153,31 @@ CREATE TABLE IF NOT EXISTS attendance.nfc_student_cards (
     CONSTRAINT nfc_student_cards_card_number_uq
         UNIQUE (card_number),
     CONSTRAINT nfc_student_cards_is_verified_ck
-        CHECK (is_verified IN (1, 2)),
+        CHECK (is_verified IN (0, 1, 2)),
     CONSTRAINT nfc_student_cards_registration_type_ck
         CHECK (registration_type IN (1, 2))
 );
 
 COMMENT ON TABLE attendance.nfc_student_cards IS
     'NFC card <-> student mapping. student_applicant_id is an opaque external key: no applicant registry exists to reference.';
+
+-- ---------------------------------------------------------------------
+-- 2b · Widen `is_verified` on a table that already exists
+--
+-- `CREATE TABLE IF NOT EXISTS` above skips everything — including the CHECK —
+-- on a database that already has this table, so the third state has to be
+-- added explicitly. Without this, a save made while the face gate is OFF fails
+-- with a constraint violation instead of storing 0.
+--
+-- Safe to re-run, and safe on rows that already exist: 0 only widens what is
+-- allowed, so nothing stored can suddenly violate it.
+-- ---------------------------------------------------------------------
+
+ALTER TABLE attendance.nfc_student_cards
+    DROP CONSTRAINT IF EXISTS nfc_student_cards_is_verified_ck;
+
+ALTER TABLE attendance.nfc_student_cards
+    ADD CONSTRAINT nfc_student_cards_is_verified_ck CHECK (is_verified IN (0, 1, 2));
 
 -- ---------------------------------------------------------------------
 -- 3 · Audit trail
@@ -377,11 +404,31 @@ COMMENT ON FUNCTION attendance.nfc_card_reg_status(varchar) IS
 -- re-verifying a student would otherwise wipe the images the previous save
 -- uploaded, and the caller has no way to send "unchanged".
 --
--- registration_type = 2 (Self) FORCES is_verified = 2, whatever was passed in,
--- so a self-registration can never mark itself trusted. The spec recommends
--- it; it is enforced here rather than in the handler because this function is
--- the only writer and a second caller must not be able to bypass it.
+-- TWO RULES FORCE `is_verified`, whatever the caller sent, because both are
+-- statements about what actually happened rather than what the desk claims:
+--
+--   * `p_face_checked = false` FORCES 0 ("Not Face-Checked"). The save was
+--     made while the face gate was OFF — see NFC_FACE_VERIFY in
+--     sql/008_system_settings.sql — so the card photo and the selfie were
+--     never compared. Recording 1 there would be a lie, and recording 2 would
+--     be indistinguishable from a save that WAS checked and is merely awaiting
+--     review. It outranks the self-registration rule below, which it also
+--     satisfies: 0 is not "verified" either.
+--
+--   * registration_type = 2 (Self) FORCES 2, so a self-registration can never
+--     mark itself trusted.
+--
+-- The handler supplies `p_face_checked` because only it knows: the comparison
+-- is an HTTP call Postgres cannot make, and the toggle has an environment
+-- fallback SQL cannot read (src/utils/settings.rs).
 -- ---------------------------------------------------------------------
+
+-- Adding a parameter is not something CREATE OR REPLACE can do — it would
+-- leave the 9-argument version in place as an overload, and a caller that
+-- omitted the new flag would silently get the old behaviour. Dropping first is
+-- what makes the new rule unavoidable.
+DROP FUNCTION IF EXISTS attendance.nfc_card_save_info(
+    varchar, varchar, smallint, smallint, text, text, boolean, bigint, varchar);
 
 CREATE OR REPLACE FUNCTION attendance.nfc_card_save_info(
     p_student_applicant_id varchar,
@@ -392,7 +439,11 @@ CREATE OR REPLACE FUNCTION attendance.nfc_card_save_info(
     p_student_selfie       text,
     p_force_reassign       boolean,
     p_performed_by         bigint,
-    p_client_ip            varchar
+    p_client_ip            varchar,
+    -- Did the face gate actually compare the two photographs for this save?
+    -- Defaults true so a direct SQL caller keeps the old meaning; the handler
+    -- always passes it explicitly.
+    p_face_checked         boolean DEFAULT true
 ) RETURNS jsonb
 LANGUAGE plpgsql
 AS $function$
@@ -417,6 +468,10 @@ BEGIN
             'message', 'student_applicant_id, card_number, and registration_type are required');
     END IF;
 
+    -- 0 is deliberately NOT accepted here. It means "this service did not
+    -- compare the photographs", which is ours to record and not a desk's to
+    -- claim — and a caller who reads a 0 back and sends it again is telling us
+    -- something they cannot know. The gate below sets it.
     IF v_reg_type NOT IN (1, 2)
        OR (p_is_verified IS NOT NULL AND p_is_verified NOT IN (1, 2)) THEN
         RETURN jsonb_build_object(
@@ -432,6 +487,13 @@ BEGIN
     -- Self-registration can never mark itself verified.
     IF v_reg_type = 2 THEN
         v_verified := 2;
+    END IF;
+
+    -- ...and nothing can be called verified, or even "checked and awaiting
+    -- review", when no comparison happened. Applied LAST so it outranks both
+    -- the caller's value and the self-registration rule.
+    IF NOT coalesce(p_face_checked, true) THEN
+        v_verified := 0;
     END IF;
 
     IF length(v_applicant) > 64 THEN
@@ -565,6 +627,11 @@ BEGIN
                 SELECT 'is_verified forced to 2 — a self-registration (registration_type=2) '
                     || 'cannot mark itself verified' AS w
                  WHERE v_reg_type = 2 AND p_is_verified = 1
+                   AND coalesce(p_face_checked, true)
+                UNION ALL
+                SELECT 'is_verified recorded as 0 (Not Face-Checked) — face verification '
+                    || 'was OFF, so the card photo and the selfie were not compared'
+                 WHERE NOT coalesce(p_face_checked, true)
                 UNION ALL
                 SELECT 'Card taken from ' || v_reassigned || ' — that student now has no card'
                  WHERE v_reassigned IS NOT NULL

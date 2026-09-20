@@ -1057,6 +1057,12 @@ AS $function$
         'is_verified_label', CASE p_is_verified
                                  WHEN 1 THEN 'Verified'
                                  WHEN 2 THEN 'Not Verified'
+                                 -- Written by the service, never by a caller:
+                                 -- the save happened while the face gate was
+                                 -- OFF, so the two photographs were never
+                                 -- compared. Distinct from 2 on purpose — that
+                                 -- one means "checked, awaiting review".
+                                 WHEN 0 THEN 'Not Face-Checked'
                              END,
         'registration_type_label', CASE p_registration_type
                                        WHEN 1 THEN 'Admin'
@@ -1086,7 +1092,8 @@ CREATE TABLE IF NOT EXISTS attendance.nfc_student_cards (
     -- baking it into rows would strand them behind a hostname change.
     card_image           text,
     student_selfie       text,
-    -- 1 = Yes, 2 = No.
+    -- 1 = Verified, 2 = Not Verified (checked, awaiting review),
+    -- 0 = Not Face-Checked — the save was made while the face gate was OFF.
     is_verified          smallint    NOT NULL DEFAULT 2,
     -- 1 = Admin, 2 = Self.
     registration_type    smallint    NOT NULL,
@@ -1101,7 +1108,7 @@ CREATE TABLE IF NOT EXISTS attendance.nfc_student_cards (
     CONSTRAINT nfc_student_cards_card_number_uq
         UNIQUE (card_number),
     CONSTRAINT nfc_student_cards_is_verified_ck
-        CHECK (is_verified IN (1, 2)),
+        CHECK (is_verified IN (0, 1, 2)),
     CONSTRAINT nfc_student_cards_registration_type_ck
         CHECK (registration_type IN (1, 2))
 );
@@ -1340,6 +1347,9 @@ COMMENT ON FUNCTION attendance.nfc_card_reg_status(varchar) IS
 -- the only writer and a second caller must not be able to bypass it.
 -- ---------------------------------------------------------------------
 
+DROP FUNCTION IF EXISTS attendance.nfc_card_save_info(
+    varchar, varchar, smallint, smallint, text, text, boolean, bigint, varchar);
+
 CREATE OR REPLACE FUNCTION attendance.nfc_card_save_info(
     p_student_applicant_id varchar,
     p_card_number          varchar,
@@ -1349,7 +1359,11 @@ CREATE OR REPLACE FUNCTION attendance.nfc_card_save_info(
     p_student_selfie       text,
     p_force_reassign       boolean,
     p_performed_by         bigint,
-    p_client_ip            varchar
+    p_client_ip            varchar,
+    -- Did the face gate actually compare the two photographs for this save?
+    -- Defaults true so a direct SQL caller keeps the old meaning; the handler
+    -- always passes it explicitly.
+    p_face_checked         boolean DEFAULT true
 ) RETURNS jsonb
 LANGUAGE plpgsql
 AS $function$
@@ -1374,6 +1388,10 @@ BEGIN
             'message', 'student_applicant_id, card_number, and registration_type are required');
     END IF;
 
+    -- 0 is deliberately NOT accepted here. It means "this service did not
+    -- compare the photographs", which is ours to record and not a desk's to
+    -- claim — and a caller who reads a 0 back and sends it again is telling us
+    -- something they cannot know. The gate below sets it.
     IF v_reg_type NOT IN (1, 2)
        OR (p_is_verified IS NOT NULL AND p_is_verified NOT IN (1, 2)) THEN
         RETURN jsonb_build_object(
@@ -1389,6 +1407,13 @@ BEGIN
     -- Self-registration can never mark itself verified.
     IF v_reg_type = 2 THEN
         v_verified := 2;
+    END IF;
+
+    -- ...and nothing can be called verified, or even "checked and awaiting
+    -- review", when no comparison happened. Applied LAST so it outranks both
+    -- the caller's value and the self-registration rule.
+    IF NOT coalesce(p_face_checked, true) THEN
+        v_verified := 0;
     END IF;
 
     IF length(v_applicant) > 64 THEN
@@ -1522,6 +1547,11 @@ BEGIN
                 SELECT 'is_verified forced to 2 — a self-registration (registration_type=2) '
                     || 'cannot mark itself verified' AS w
                  WHERE v_reg_type = 2 AND p_is_verified = 1
+                   AND coalesce(p_face_checked, true)
+                UNION ALL
+                SELECT 'is_verified recorded as 0 (Not Face-Checked) — face verification '
+                    || 'was OFF, so the card photo and the selfie were not compared'
+                 WHERE NOT coalesce(p_face_checked, true)
                 UNION ALL
                 SELECT 'Card taken from ' || v_reassigned || ' — that student now has no card'
                  WHERE v_reassigned IS NOT NULL

@@ -1146,8 +1146,12 @@ async fn nfc_save_card_info_inner(
     // nobody can account for.
     let gate = crate::utils::settings::face_verify(db.get_ref()).await;
     if !gate.enabled {
+        // The row is written with `is_verified = 0` (Not Face-Checked) — the
+        // SQL function forces it from `p_face_checked` below, so a mapping made
+        // during an off period is distinguishable afterwards from one that was
+        // checked and is merely awaiting review.
         log.step(format!(
-            "face verification is OFF ({}) — saving WITHOUT comparing the card photo and the selfie",
+            "face verification is OFF ({}) — saving WITHOUT comparing the card photo and the selfie; is_verified will be recorded as 0",
             if gate.managed {
                 "admin setting"
             } else {
@@ -1170,12 +1174,12 @@ async fn nfc_save_card_info_inner(
         .collect();
     log.step(format!(
         "saving via attendance.nfc_card_save_info (images={:?}, force_reassign={force_reassign}, \
-         write by token user id={token_user_id})",
-        stored_paths
+         face_checked={}, write by token user id={token_user_id})",
+        stored_paths, gate.enabled
     ));
 
     let result = sqlx::query_scalar::<_, Value>(
-        "SELECT attendance.nfc_card_save_info($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        "SELECT attendance.nfc_card_save_info($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(applicant)
     .bind(card)
@@ -1186,6 +1190,10 @@ async fn nfc_save_card_info_inner(
     .bind(force_reassign)
     .bind(token_user_id)
     .bind(&client_ip)
+    // Whether the two photographs were actually compared. The function forces
+    // `is_verified = 0` when they were not — only this side knows, because the
+    // comparison is an HTTP call and the toggle has an environment fallback.
+    .bind(gate.enabled)
     .fetch_one(db.get_ref())
     .await;
 

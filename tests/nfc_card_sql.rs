@@ -86,7 +86,7 @@ fn fixture_ids() -> (String, String) {
     (format!("APPTEST-{u}"), format!("CARDTEST{u}"))
 }
 
-/// Call the save function exactly as the handler does.
+/// Call the save function exactly as the handler does, with the face gate ON.
 #[allow(clippy::too_many_arguments)]
 async fn save(
     tx: &mut Transaction<'_, Postgres>,
@@ -98,8 +98,29 @@ async fn save(
     student_selfie: Option<&str>,
     force_reassign: bool,
 ) -> Value {
+    save_gated(
+        tx, applicant, card, is_verified, registration_type, card_image,
+        student_selfie, force_reassign, true,
+    )
+    .await
+}
+
+/// The same, with `p_face_checked` spelled out — `false` is a save made while
+/// the face gate was OFF.
+#[allow(clippy::too_many_arguments)]
+async fn save_gated(
+    tx: &mut Transaction<'_, Postgres>,
+    applicant: &str,
+    card: Option<&str>,
+    is_verified: Option<i16>,
+    registration_type: Option<i16>,
+    card_image: Option<&str>,
+    student_selfie: Option<&str>,
+    force_reassign: bool,
+    face_checked: bool,
+) -> Value {
     sqlx::query_scalar::<_, Value>(
-        "SELECT attendance.nfc_card_save_info($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        "SELECT attendance.nfc_card_save_info($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(applicant)
     .bind(card)
@@ -110,6 +131,7 @@ async fn save(
     .bind(force_reassign)
     .bind(45320_i64)
     .bind("127.0.0.1")
+    .bind(face_checked)
     .fetch_one(&mut **tx)
     .await
     .expect("card save call failed")
@@ -822,6 +844,77 @@ async fn self_registration_cannot_mark_itself_verified() {
 }
 
 #[tokio::test]
+async fn a_save_made_with_the_face_gate_off_is_recorded_as_not_face_checked() {
+    let pool = db_or_skip!();
+    let mut tx = pool.begin().await.expect("begin");
+    let (applicant, card) = fixture_ids();
+
+    // The desk asked for "Verified". Nothing compared the two photographs, so
+    // the row must not say so — and must not say "2" either, which would be
+    // indistinguishable from a save that WAS checked and is awaiting review.
+    let r = save_gated(&mut tx, &applicant, Some(&card), Some(1), Some(1), None, None, false, false).await;
+    assert!(ok(&r), "{r}");
+    assert_eq!(data(&r, "is_verified"), 0);
+    assert_eq!(data(&r, "is_verified_label"), "Not Face-Checked");
+
+    // And the caller is told, rather than having to notice.
+    assert!(
+        warnings(&r).iter().any(|w| w.contains("Not Face-Checked")),
+        "the forced value should be warned about: {:?}",
+        warnings(&r)
+    );
+
+    // The lookups report it like any other state.
+    let found = get_info(&mut tx, Some(&card)).await;
+    assert_eq!(data(&found, "is_verified"), 0);
+    assert_eq!(data(&found, "is_verified_label"), "Not Face-Checked");
+}
+
+#[tokio::test]
+async fn not_face_checked_outranks_the_self_registration_rule() {
+    let pool = db_or_skip!();
+    let mut tx = pool.begin().await.expect("begin");
+    let (applicant, card) = fixture_ids();
+
+    // Self-registration normally forces 2. With no face check it is 0, which
+    // still satisfies what that rule exists for — a self-registration cannot
+    // call itself verified — while saying something 2 does not: nobody looked.
+    let r = save_gated(&mut tx, &applicant, Some(&card), Some(1), Some(2), None, None, false, false).await;
+    assert!(ok(&r));
+    assert_eq!(data(&r, "is_verified"), 0);
+}
+
+#[tokio::test]
+async fn a_later_checked_save_clears_the_not_face_checked_state() {
+    let pool = db_or_skip!();
+    let mut tx = pool.begin().await.expect("begin");
+    let (applicant, card) = fixture_ids();
+
+    save_gated(&mut tx, &applicant, Some(&card), Some(1), Some(1), None, None, false, false).await;
+    assert_eq!(data(&get_info(&mut tx, Some(&card)).await, "is_verified"), 0);
+
+    // Turning the gate back on and re-saving is how a card leaves that state —
+    // it is not sticky, it is a record of what happened at write time.
+    let again = save(&mut tx, &applicant, Some(&card), Some(1), Some(1), None, None, false).await;
+    assert!(ok(&again));
+    assert_eq!(data(&again, "is_verified"), 1);
+}
+
+#[tokio::test]
+async fn zero_cannot_be_claimed_by_a_caller() {
+    let pool = db_or_skip!();
+    let mut tx = pool.begin().await.expect("begin");
+    let (applicant, card) = fixture_ids();
+
+    // 0 means "this service did not compare the photographs". A desk cannot
+    // assert that about us, and a client that read a 0 back and echoed it is
+    // telling us something it cannot know.
+    let r = save(&mut tx, &applicant, Some(&card), Some(0), Some(1), None, None, false).await;
+    assert!(!ok(&r), "{r}");
+    assert_eq!(code(&r), "invalid_value");
+}
+
+#[tokio::test]
 async fn is_verified_defaults_to_unreviewed() {
     let pool = db_or_skip!();
     let mut tx = pool.begin().await.expect("begin");
@@ -991,7 +1084,7 @@ async fn required_fields_are_enforced() {
 }
 
 #[tokio::test]
-async fn the_enums_accept_only_one_and_two() {
+async fn the_enums_accept_only_one_and_two_from_callers() {
     let pool = db_or_skip!();
     let mut tx = pool.begin().await.expect("begin");
     let (applicant, card) = fixture_ids();
