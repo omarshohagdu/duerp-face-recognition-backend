@@ -118,6 +118,44 @@ async fn require_admin(
     }
 }
 
+/// Turn a rejected JSON body into this API's envelope.
+///
+/// Actix answers a bad payload with PLAIN TEXT — `Content type error`, or
+/// `Json deserialize error: …`. A client that expects `{"success": …}` gets a
+/// string, reads `success` as `undefined`, and shows an empty error: the
+/// failure that started this was invisible for exactly that reason.
+///
+/// Registered on the `/admin-api` scope in `main.rs`, so every JSON extractor
+/// under it answers in one shape.
+pub fn json_error_handler(
+    err: actix_web::error::JsonPayloadError,
+    _req: &actix_web::HttpRequest,
+) -> actix_web::Error {
+    use actix_web::error::JsonPayloadError;
+
+    // Name the two failures a caller can actually act on, and keep serde's own
+    // message for the rest — "missing field `nfc_face_verify`" is the useful
+    // part, and inventing our own wording would lose it.
+    let (code, message) = match &err {
+        JsonPayloadError::ContentType => (
+            "invalid_content_type",
+            "Send the body as JSON with `Content-Type: application/json`".to_string(),
+        ),
+        JsonPayloadError::Deserialize(e) => ("invalid_json", format!("Invalid JSON body: {e}")),
+        other => ("invalid_json", format!("Could not read the JSON body: {other}")),
+    };
+
+    actix_web::error::InternalError::from_response(
+        err,
+        HttpResponse::BadRequest().json(json!({
+            "success": false,
+            "code":    code,
+            "message": message,
+        })),
+    )
+    .into()
+}
+
 fn logger(req: &actix_web::HttpRequest) -> StepLogger {
     let log = StepLogger::new("admin-api/settings/nfc-face-verify");
     log.set_base_url(&public_base_url(req));

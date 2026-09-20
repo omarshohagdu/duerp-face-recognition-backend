@@ -208,6 +208,13 @@ async fn main() -> std::io::Result<()> {
                 web::scope("/admin-api")
                     .wrap(middleware::api_logger::ApiLogger)
                     .wrap(middleware::ext_auth_middleware::ExtAuthMiddleware)
+                    // A rejected body answers in this API's envelope instead of
+                    // actix's plain text ("Content type error"), which a client
+                    // expecting JSON renders as an empty error box.
+                    .app_data(
+                        web::JsonConfig::default()
+                            .error_handler(routes::settings::json_error_handler),
+                    )
                     .service(routes::settings::get_nfc_face_verify) // GET  /admin-api/settings/nfc-face-verify
                     .service(routes::settings::put_nfc_face_verify) // PUT  /admin-api/settings/nfc-face-verify (json: nfc_face_verify, nfc_face_verify_url?)
             )
