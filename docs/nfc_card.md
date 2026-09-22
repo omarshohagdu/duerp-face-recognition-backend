@@ -8,7 +8,7 @@ Three endpoints:
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` (or `GET`) | `/ext-api/nfc-card/get_card_info` | Scan lookup → applicant id, card number, and the two flags with readable labels. Nothing else: it is called on every tap, so the payload stays small and free of PII. |
+| `POST` (or `GET`) | `/ext-api/nfc-card/get_card_info` | Scan lookup → applicant id, card number, the two flags with readable labels, and `details`: the student's name, department and photo, fetched from DU. |
 | `POST` | `/ext-api/nfc-card/save_card_info` | Create or update a student's card record. Always carries a card photo **and** a selfie, and saves only if a face-match service says they are the same person. |
 | `POST` (or `GET`) | `/ext-api/nfc-card/checking_card_reg_status` | **Does this student already hold a card?** Asked with `registration_no`, not a card number. Returns the whole registration — images, timestamps, `is_registered` — and a `data` object on *every* response. For a desk deciding what to do next, not for a turnstile. |
 
@@ -179,18 +179,34 @@ Any separator style works for the value itself — see
   "status": "success",
   "message": "Data Found",
   "data": {
-    "student_applicant_id": "APP-2026-00123",
+    "student_applicant_id": "2020218753",
     "card_number": "04A1B2C3D4E5",
     "is_verified": 1,
     "is_verified_label": "Verified",
     "registration_type": 1,
-    "registration_type_label": "Admin"
+    "registration_type_label": "Admin",
+    "details": {
+      "status": "success",
+      "data": {
+        "name": "Pothik Roy",
+        "reg_no": "2020218753",
+        "dept": "Department of Television, Film and Photography",
+        "program": "Bachelor of Social Sciences in Television, Film and Photography",
+        "academic_session": "2020-2021",
+        "hall": "Jagannath Hall",
+        "roll_no": "jn-147-032",
+        "email": "pothik-8th-2020218753@tfp.du.ac.bd",
+        "semester": "1st Semester",
+        "image": "https://ssl.du.ac.bd/fontView/images/student_profile_update/student_image/45916.png"
+      }
+    }
   }
 }
 ```
 
-The four contract fields plus a readable label for each enum, and nothing else.
-No image paths, no timestamps, no other PII.
+The four contract fields, a readable label for each enum, and `details` — the
+student record behind `student_applicant_id`, under [an envelope of its
+own](#details--the-student-record). No card image paths, no timestamps.
 
 | Field | `0` | `1` | `2` |
 |---|---|---|---|
@@ -211,6 +227,127 @@ value outside `1`/`2` yields `null` rather than a wrong label.
 **Unverified students are returned normally**, with `is_verified: 2`. The flag
 is the answer; the caller decides what an unreviewed mapping may do. This
 endpoint reports the mapping, it does not police it.
+
+### `details` — the student record
+
+The card row holds one fact about the student: the applicant id the desk
+registered the card against. A reader wants a name and a photograph, so this
+endpoint fetches them from DU:
+
+```
+POST {SSL_API_ENDPOINT}/get_student_info    →  http://host/api/get_student_info
+header: secret-key
+form:   student_reg_no=<student_applicant_id>
+```
+
+`SSL_API_ENDPOINT` normally already carries DU's `/api` prefix
+(`http://host/api/`); a value written without it gets the prefix added, so
+either spelling reaches the same URL.
+
+DU's `data` object is passed through **whole and unmodified** — a field DU adds
+later reaches the reader with no change here, so treat the list above as
+today's fields rather than a fixed contract. The fields are DU's, not this
+service's: `reg_no` comes back from DU and may differ in spelling from the
+`student_applicant_id` that was sent, since that column is an opaque external
+identifier with no foreign key (see `sql/004_nfc_card.sql`).
+
+#### `details` carries its own `status` and `data`
+
+```json
+"details": { "status": "success", "data": { "name": "Pothik Roy", … } }
+"details": { "status": "error",   "data": {} }
+```
+
+**Two statuses, two different questions.** The outer one is about the card —
+`"status": "success"` means the mapping was found and the tap is valid. The one
+inside `details` is about the student record *only*. They move independently,
+and that is the whole point of the nesting: a reader can tell *"registered, and
+here is who holds it"* from *"registered, but DU could not tell us who"* without
+either answer disturbing the other.
+
+| | `details.status` | `details.data` |
+|---|---|---|
+| DU returned a record | `"success"` | The record, whole |
+| Anything else | `"error"` | `{}` |
+
+`details.data` is **always an object** — `{}` when there is nothing, never
+`null` and never absent. That is the same promise `checking_card_reg_status`
+makes about its own `data`, so one status check is all a client needs and a
+null check on `details` is never one of them.
+
+There is **no `message`** inside `details`. DU's prose has no stable wording,
+does not exist at all for a timeout, and a synthesised one would give clients
+something to match on that this service cannot keep stable. The reason is in the
+step log instead, where an operator looks for it.
+
+**`details.status` is `"error"` — with the response still `200 success` —
+when:**
+
+| Case | Why |
+|---|---|
+| DU does not know the applicant id (`404`) | Nothing validates that column on save, so an unknown or typo'd id is registrable |
+| DU is down, slow, or unreachable | Bounded by `NFC_STUDENT_INFO_TIMEOUT_SECS` (default 5s) |
+| DU rejected this service's `secret-key` (`401`) | An operator problem, not the student's |
+| `SSL_API_ENDPOINT` is not configured | Same |
+| The card row carries no applicant id | Nothing to look up |
+| DU answered `success` with an empty or absent `data` | An empty record is not a record |
+| DU answered `status: "error"` but sent a record anyway | A record DU labelled an error is not trusted onto a turnstile screen |
+
+That is deliberate: the card mapping is what this endpoint answers and it comes
+out of the database complete, so a DU outage must never turn a card that **is**
+registered into a failed scan at a turnstile. Every `"error"` has its reason
+recorded in that scan's [step log](#reading-the-step-log-for-one-call).
+
+### Handling an empty `details`
+
+**Branch on `details.status`. Never null-check `details`, and never test
+whether a key is there** — `details`, `details.status` and `details.data` are
+on every successful scan.
+
+```js
+const { data } = await scan(cardNumber);       // 200 · status "success"
+
+// The scan succeeded — the card IS registered — whether or not DU answered.
+showAccess(data.is_verified, data.registration_type);
+
+if (data.details.status === "success") {
+  const s = data.details.data;
+  show(s.name, s.image);
+} else {
+  // Not "unknown card" and not an error: the mapping is good, the student
+  // record just isn't available. Show the id you do have.
+  show(data.student_applicant_id, placeholderAvatar);
+}
+```
+
+What is *inside* a record is DU's business. Treat individual fields as
+optional — a record missing `hall` is DU's answer, not a malformed response.
+
+The wrong reading is to treat `details.status: "error"` as a failed scan. A
+card with an outer `"status": "success"` is registered; `details` only decides
+**what you can put on the screen**, never **whether the tap is valid**. If a
+turnstile needs a name before it opens, that is a policy decision to make
+explicitly — and it will deny entry to everyone during a DU outage.
+
+```js
+if (data.details.status !== "success") { /* ← this denies access when DU is down */ }
+```
+
+Two shapes that look similar and are not:
+
+```js
+data.status                  // the CARD.    "success" = this tap is valid.
+data.details.status          // the STUDENT. "error"   = no name to show.
+```
+
+The same care applies to `image`: it points at `ssl.du.ac.bd`, so the
+**reader's own network** has to reach DU to load it, not just this service. A
+record can arrive intact and the photo still fail — give it an `onerror`
+fallback.
+
+One DU round-trip is made per tap and nothing is cached — a scan is not
+frequent enough to need it, and a stale name on a screen is worse than a second
+call.
 
 ### Errors
 
@@ -575,12 +712,13 @@ Every one of them carries `"data": {}`.
 | Question | *Who does this card belong to?* | *Does this student already hold a card?* |
 | Asked with | `card_number` | `registration_no` |
 | Caller | Turnstile / reader, on every tap | Registration desk, before issuing a card |
-| Payload | 4 fields + 2 labels | The whole row: images, timestamps, `is_registered` |
+| Payload | 4 fields + 2 labels + `details` (name, dept, photo, from DU, under its own `status`) | The whole row: card images, timestamps, `is_registered` |
 | `data` on failure | absent | `{}` |
 
 Both read `nfc_student_cards` and never disagree about it — they differ in which
 end they come at it from, and in what the caller is entitled to see. A turnstile
-has no use for a student's selfie, so it does not get one: **don't call
+gets the student's name and profile photo, which is what it puts on screen, but
+not the stored card image or selfie and not the audit timestamps: **don't call
 `checking_card_reg_status` on every tap.**
 
 > **"Registered" is not "verified".** A card with `is_verified: 2` is still
@@ -710,11 +848,13 @@ lands.
 | `NFC_FACE_VERIFY_URL` | *(unset)* | Face-match endpoint for `save_card_info`, e.g. `http://10.224.224.101:8089/verify`. **Unset means every save is rejected** with 503 — the gate fails closed. **A fallback now:** once an admin saves the setting (`PUT /admin-api/settings/nfc-face-verify`), the stored value wins and this is ignored — see [Turning it on and off](#turning-it-on-and-off). |
 | `NFC_FACE_VERIFY_API_KEY` | *(empty)* | Sent as `X-API-Key` to that service. A rejected key is a 503, not a 400. |
 | `NFC_FACE_VERIFY_TIMEOUT_SECS` | 30 | Timeout for the match call. It bounds a save, so keep it under the proxy read timeout in front of this service. |
+| `NFC_STUDENT_INFO_TIMEOUT_SECS` | 5 | Timeout for the `get_student_info` call behind [`details`](#details--the-student-record). It bounds a scan, so a slow DU costs at most this much before the card comes back with `details.status: "error"`. |
 
 These are not NFC-specific but every call fails without them:
 
 | Variable | Purpose |
 |---|---|
+| `SSL_API_ENDPOINT` | DU's backend, where `get_student_info` lives. Unset means `details.status: "error"` on every scan; everything else still works. |
 | `EXT_APP_ID` | Must equal the `X-App-Id` header, byte for byte. |
 | `EXT_APP_PASSWORD` | Must equal the `X-App-Password` header, byte for byte. **In `.env` this value is single-quoted; `dotenvy` strips the quotes, so the header takes the INNER value.** See [Troubleshooting](#401-invalid-app-id-or-password). |
 | `JWT_SECRET` | Verifies the bearer token. Must be byte-identical to duerp-api's. |
@@ -894,6 +1034,36 @@ A **400** `face_mismatch` or `face_not_comparable` is a different thing: the
 gate worked and the photos are the problem. `face_not_comparable` usually means
 no detectable face — a glare-washed card photo or a cropped selfie.
 
+### `details.status` is `"error"` on every scan
+
+The card came back, so the database is fine — only the DU lookup behind
+[`details`](#details--the-student-record) failed, and it never fails a scan.
+The response still says `"status": "success"` at the top level; it is
+`details.status` that is `"error"`.
+The step log for the tap names the reason on one line; these are the three that
+account for nearly all of it:
+
+```bash
+# 1 · Is the base URL set, and does it carry DU's /api prefix?
+grep SSL_API_ENDPOINT .env
+
+# 2 · Does DU answer THIS host? (the reader's network is irrelevant — this
+#     service makes the call). Use an applicant id you know is real.
+curl -s -X POST "${SSL_API_ENDPOINT%/}/get_student_info" \
+  -H "secret-key: <the key in src/utils/constants.rs>" \
+  -d "student_reg_no=2020218753"
+```
+
+- `{"status":["Unauthorized"]}` (401) → DU rejected this service's
+  `secret-key`. An operator fix; no card needs re-registering.
+- `{"status":"error","message":"No student found for - …"}` (404) → DU does not
+  know that applicant id. Expected for a card registered against a typo'd or
+  non-student id — nothing validates that column on save.
+- HTML instead of JSON → the request reached DU as a `GET` and was redirected
+  to its login page. Something in front of this service rewrote the method.
+- Only slow scans, `details` empty on some taps → DU is answering slower than
+  `NFC_STUDENT_INFO_TIMEOUT_SECS`. Raise it only if the reader can wait.
+
 ### Reading the step log for one call
 
 Every call writes one file to `WOW_LOG_DIR`, named `{id}_{timestamp}.log`, with
@@ -924,6 +1094,7 @@ Read them on the box, or through the gated
 | Errors as `{ "success": false, "error": "…" }` | `{ "status": "error", "message": "…", "code": "…" }` | Superseded by a later request: this module reports outcome as `status` (`"success"`/`"error"`) with a `message`, and carries no `success` boolean and no `error` key. `code` is the stable machine-readable form — match on that, not on the prose. |
 | — (not in the spec) | `checking_card_reg_status`, asked with `registration_no` | Requested later: a desk needs to know whether a student already has a card *before* it registers one, and wants the record it would be clashing with. `get_card_info` could not simply grow the payload — a turnstile calls it on every tap and should not carry images or timestamps — so it is a third endpoint over the same row, entered from the student side. |
 | — (not in the spec) | `is_verified_label` / `registration_type_label` | Requested: the response carries each enum's meaning alongside the number, so a screen need not hard-code the mapping. |
+| — (not in the spec) | `data.details`, the student record from DU's `get_student_info`, under its own `status` + `data` | Requested: a reader that has just scanned a card needs a name and a photograph, and the card row holds only an applicant id. Fetched per tap and best-effort — its own `status` goes to `"error"` rather than the card's when DU cannot answer, so an outage there never fails a scan. See [`details`](#details--the-student-record). |
 | Image URLs like `.../cards/APP-2026-00123.jpg` | UUID-prefixed filenames | A deterministic name would clobber the previous image on re-save and lose the audit trail. |
 | Card reassignment "silently / `force_reassign` / blocked" (open question) | `409` by default, `force_reassign=true` to override | Blocking outright would need a DBA for every re-issue; silent overwrite lets a typo'd scan quietly unassign a card. |
 | `save_card_info` auth "admin/staff role" | Bearer token only | This service has no role to check — the token carries only `sub` and `exp`. See the warning under [Auth](#auth). |

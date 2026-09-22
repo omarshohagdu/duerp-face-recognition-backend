@@ -27,10 +27,13 @@ static AI_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .unwrap_or_else(|_| reqwest::Client::new())
 });
 
-// Shared HTTP client for DU backend calls (getByEmployeeId). Kept separate from
-// AI_CLIENT so the identity lookup, which sits in front of every enroll/verify,
-// gets a tighter timeout than the image uploads.
-static DU_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+// Shared HTTP client for DU backend calls — `getByEmployeeId` here, and
+// `get_student_info` from `routes::nfc_card`. Kept separate from AI_CLIENT so
+// the identity lookups, which sit in front of every enroll/verify and every
+// card scan, get a tighter timeout than the image uploads: both callers have
+// somebody waiting at a reader or a camera, so a stalled DU is better answered
+// without the record than held open for it.
+pub(crate) static DU_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()

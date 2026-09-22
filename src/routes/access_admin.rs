@@ -7,6 +7,9 @@
 //!   POST /ext-api/access/users          — list accounts, their role, overrides and effective set
 //!   POST /ext-api/access/user-role      — put a person in a role, or take them out
 //!   POST /ext-api/access/user-override  — one person's exception: grant | deny | clear
+//!   POST /ext-api/access/role-active    — retire or restore a role
+//!   POST /ext-api/access/user-status    — the kill switch: active | inactive
+//!   POST /ext-api/access/user-delete    — delete an account and its overrides
 //!
 //! Design: `docs/access_control.md` §2.1 option (c). The roles this service
 //! enforces are administered here, because the ERP's screens write `ictcell`
@@ -328,6 +331,103 @@ pub struct UserOverrideRequest {
     pub permission: String,
     /// `grant` | `deny` | `clear`.
     pub effect: String,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+pub struct RoleActiveRequest {
+    pub key: String,
+    /// `false` retires the role: it stops being assignable. Everybody already
+    /// holding it keeps exactly what they had — see `sql/008`, which states
+    /// why that is narrow on purpose.
+    pub is_active: bool,
+}
+
+#[post("/access/role-active")]
+pub async fn role_active(
+    req: actix_web::HttpRequest,
+    db: web::Data<PgPool>,
+    body: web::Json<RoleActiveRequest>,
+) -> HttpResponse {
+    let log = logger("ext-api/access/role-active", &req);
+    log.params("json", &serde_json::to_value(&*body).unwrap_or(Value::Null));
+    let (key, is_active) = (body.key.clone(), body.is_active);
+    let resp = run(
+        "role_active",
+        "/ext-api/access/role-active",
+        &req,
+        &db,
+        &log,
+        "SELECT attendance.admin_role_set_active($1, $2, $3, $4)",
+        move |q, actor, ip| q.bind(key).bind(is_active).bind(actor).bind(ip),
+    )
+    .await;
+    log_local_response(&log, resp).await
+}
+
+#[derive(Deserialize, serde::Serialize)]
+pub struct UserStatusRequest {
+    pub person_id: i64,
+    /// `active` | `inactive`. Anything else is a 400 from the SQL function
+    /// rather than a silent lockout: the gate treats every value that is not
+    /// `active` as inactive, so a typo would deny the person just as
+    /// effectively as the word that was meant.
+    pub status: String,
+}
+
+#[post("/access/user-status")]
+pub async fn user_status(
+    req: actix_web::HttpRequest,
+    db: web::Data<PgPool>,
+    body: web::Json<UserStatusRequest>,
+) -> HttpResponse {
+    let log = logger("ext-api/access/user-status", &req);
+    log.params("json", &serde_json::to_value(&*body).unwrap_or(Value::Null));
+    let (person_id, status) = (body.person_id, body.status.clone());
+    let resp = run(
+        "user_status",
+        "/ext-api/access/user-status",
+        &req,
+        &db,
+        &log,
+        "SELECT attendance.admin_user_set_status($1, $2, $3, $4)",
+        move |q, actor, ip| q.bind(person_id).bind(status).bind(actor).bind(ip),
+    )
+    .await;
+    log_local_response(&log, resp).await
+}
+
+#[derive(Deserialize, serde::Serialize)]
+pub struct UserDeleteRequest {
+    pub person_id: i64,
+}
+
+/// Delete an account. IRREVERSIBLE, and more so than it looks: nothing in this
+/// service creates `app_users` rows — they arrive by import — so the person
+/// does not get a fresh account by signing in again. They simply have none,
+/// which the gate answers as `no_account`.
+///
+/// The refusals that matter (`self_delete`, `last_admin`) are in SQL, so a DBA
+/// deleting a row by hand hits them too.
+#[post("/access/user-delete")]
+pub async fn user_delete(
+    req: actix_web::HttpRequest,
+    db: web::Data<PgPool>,
+    body: web::Json<UserDeleteRequest>,
+) -> HttpResponse {
+    let log = logger("ext-api/access/user-delete", &req);
+    log.params("json", &serde_json::to_value(&*body).unwrap_or(Value::Null));
+    let person_id = body.person_id;
+    let resp = run(
+        "user_delete",
+        "/ext-api/access/user-delete",
+        &req,
+        &db,
+        &log,
+        "SELECT attendance.admin_user_delete($1, $2, $3)",
+        move |q, actor, ip| q.bind(person_id).bind(actor).bind(ip),
+    )
+    .await;
+    log_local_response(&log, resp).await
 }
 
 #[post("/access/user-override")]

@@ -198,6 +198,9 @@ async fn main() -> std::io::Result<()> {
                     .service(routes::access_admin::users_list)     // POST /ext-api/access/users?search=&limit=&offset=
                     .service(routes::access_admin::user_role)      // POST /ext-api/access/user-role     (json: person_id, role|null)
                     .service(routes::access_admin::user_override)  // POST /ext-api/access/user-override (json: person_id, permission, effect)
+                    .service(routes::access_admin::role_active)    // POST /ext-api/access/role-active   (json: key, is_active)
+                    .service(routes::access_admin::user_status)    // POST /ext-api/access/user-status   (json: person_id, status)
+                    .service(routes::access_admin::user_delete)    // POST /ext-api/access/user-delete   (json: person_id)
                     // The settings API, mounted here as well as under
                     // /admin-api. The production gateway proxies /ext-api/ as a
                     // prefix but has no rule for /admin-api, so this is the

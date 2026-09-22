@@ -71,8 +71,9 @@ use uuid::Uuid;
 use crate::routes::wow_attendance::{
     browsable_path, detect_image_format, full_path, is_supported_image, log_local_response,
     max_upload_bytes, max_upload_mb_display, public_base_url, reduce_saved_image,
-    require_token_caller,
+    require_token_caller, DU_CLIENT,
 };
+use crate::utils::constants::{GET_STUDENT_INFO_ENDPOINT, SSL_SECRET_KEY};
 use crate::utils::step_logger::{query_to_json, StepLogger};
 
 // ---------------------------------------------------------------------
@@ -198,6 +199,253 @@ fn status_for_code(code: &str) -> actix_web::http::StatusCode {
         "card_not_found" => StatusCode::NOT_FOUND,
         "card_conflict" => StatusCode::CONFLICT,
         _ => StatusCode::BAD_REQUEST,
+    }
+}
+
+// ---------------------------------------------------------------------
+// Student details — DU's `get_student_info`
+//
+// The card row knows one thing about the student: the applicant id the desk
+// registered the card against. A reader that has just scanned a card wants a
+// name and a photograph on screen, and this service has no student registry of
+// its own to get them from — `nfc_student_cards.student_applicant_id` is an
+// opaque external identifier with no foreign key (see `sql/004_nfc_card.sql`).
+// So `get_card_info` asks DU for the record and hangs it off the response as
+// `data.details`.
+//
+// `details` carries an envelope of its own — `status` plus `data` — so the two
+// questions stay apart: the outer `status` says the tap is valid, the inner one
+// says whether there is a name to show.
+//
+// BEST-EFFORT, DELIBERATELY. The card mapping is what this endpoint answers
+// and it comes out of the database complete; the student record is decoration
+// on top of it. DU being down, slow, or not recognising the applicant id
+// therefore sets `details.status` to `"error"` and leaves the response a `200
+// success` — it must never turn a card that IS registered into a failed scan
+// at a turnstile. The reason is always in the step log, so an empty `details`
+// can be told apart from an outage after the fact.
+//
+// It costs one upstream round-trip per tap, bounded by DU_CLIENT's 10s
+// timeout. Nothing is cached: a scan is not frequent enough to need it, and a
+// stale name on a screen is worse than a second call.
+// ---------------------------------------------------------------------
+
+/// How long a student-details lookup may hold a scan, in seconds
+/// (`NFC_STUDENT_INFO_TIMEOUT_SECS`, default 5).
+///
+/// Applied per request, on top of DU_CLIENT's own 10s ceiling, because this
+/// call is on a different clock from the enroll/verify lookups that share the
+/// client: somebody is standing at a turnstile waiting for a name to appear,
+/// and details that arrive late are worth less than a prompt empty one. Raise
+/// it only if DU is habitually slow AND the reader can wait.
+fn student_info_timeout() -> Duration {
+    let secs = std::env::var("NFC_STUDENT_INFO_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(5);
+    Duration::from_secs(secs)
+}
+
+/// `SSL_API_ENDPOINT` → the full `get_student_info` URL.
+///
+/// The endpoint lives under DU's `/api` prefix, and `SSL_API_ENDPOINT` is
+/// normally written WITH it (`http://host/api/`) — that is what
+/// `getByEmployeeId` relies on. A base written without it is accepted too and
+/// gets the prefix added, rather than calling `http://host/get_student_info`
+/// and reading DU's 404 as "no such student". Either spelling of the variable
+/// therefore reaches the same URL.
+fn student_info_url(base: &str) -> String {
+    let base = base.trim().trim_end_matches('/');
+    let has_api_prefix = base
+        .rsplit('/')
+        .next()
+        .is_some_and(|last| last.eq_ignore_ascii_case("api"));
+    if has_api_prefix {
+        format!("{base}/{GET_STUDENT_INFO_ENDPOINT}")
+    } else {
+        format!("{base}/api/{GET_STUDENT_INFO_ENDPOINT}")
+    }
+}
+
+/// A reply body, clipped, for one step line. `Value` has no short Display and
+/// the full record is already echoed in the response section.
+fn render_brief(body: &Value) -> String {
+    body.to_string().chars().take(300).collect()
+}
+
+/// `data.details` — DU's student record for an applicant id.
+///
+///   POST {SSL_API_ENDPOINT}get_student_info   header: secret-key
+///   form: student_reg_no=<applicant id>
+///   200 { "status": "success", "data": { name, reg_no, dept, program,
+///                                        academic_session, hall, roll_no,
+///                                        email, semester, image } }
+///   404 { "status": "error", "message": "No student found for - …", "data": null }
+///   422 — `student_reg_no` was missing;  401 — our `secret-key` was rejected
+///
+/// `None` for every one of those, and for an unreachable DU: the caller turns
+/// it into `null`. The `data` object is passed through WHOLE rather than
+/// re-shaped field by field, so a field DU adds later reaches the reader
+/// without a change here.
+async fn du_get_student_details(log: &StepLogger, student_reg_no: &str) -> Option<Value> {
+    let base = match std::env::var("SSL_API_ENDPOINT") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => {
+            log.step("SSL_API_ENDPOINT not configured — student details omitted");
+            return None;
+        }
+    };
+    let url = student_info_url(&base);
+
+    log.step(format!(
+        "fetching student details: POST {url} (student_reg_no={student_reg_no})"
+    ));
+    let resp = match DU_CLIENT
+        .post(&url)
+        .timeout(student_info_timeout())
+        .header("secret-key", SSL_SECRET_KEY)
+        .form(&[("student_reg_no", student_reg_no)])
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            log.step(format!(
+                "student details request FAILED ({e}) — returning the card without them"
+            ));
+            return None;
+        }
+    };
+
+    let status = resp.status();
+    let raw = resp.text().await.unwrap_or_default();
+    let body: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => {
+            // The reply itself, not a swallowed parse error: DU answers a GET
+            // with an HTML redirect to its login page, and that page is the
+            // whole explanation when a proxy has rewritten the method. Logged
+            // as a step rather than through `backend_response*`, which is the
+            // slot for what THIS service answered the reader and would be
+            // overwritten by it a moment later.
+            let head: String = raw.chars().take(300).collect();
+            log.step(format!(
+                "student details came back as non-JSON (HTTP {}): {head} — returning the card without them",
+                status.as_u16()
+            ));
+            return None;
+        }
+    };
+
+    if status.is_success() {
+        match details_from_reply(&body) {
+            Some(details) => {
+                log.step(format!("student details found (HTTP {})", status.as_u16()));
+                return Some(details);
+            }
+            None => {
+                log.step(format!(
+                    "student details reply carried no record ({}) — returning the card without them",
+                    render_brief(&body)
+                ));
+                return None;
+            }
+        }
+    }
+
+    // A 404 is the ordinary case — a card registered against an id DU does not
+    // know, which is exactly what an opaque identifier with no foreign key
+    // allows. Logged as such, at the same level as the rest: the scan still
+    // succeeded.
+    let message = body
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("no message");
+    log.step(format!(
+        "student details unavailable (HTTP {} — {message}) — returning the card without them",
+        status.as_u16()
+    ));
+    None
+}
+
+/// The student record inside a `get_student_info` reply, or `None` when the
+/// reply carries no record at all.
+///
+/// **`None` covers empty as well as absent**, and that is the point: `data`
+/// arriving as `null`, as `{}`, or beside a `status: "error"` answered with a
+/// 200 all mean DU had nothing to say. An empty object passed through would
+/// reach the reader as `details.status: "success"` with nothing under `data`
+/// — a blank name on screen, the one failure this endpoint can produce that
+/// looks like a working scan. `None` here becomes `details.status: "error"`
+/// instead, so a `"success"` always has a record behind it.
+///
+/// What is IN the record is still DU's business — no field is required here,
+/// because a record missing `hall` is DU's answer and not this service's to
+/// second-guess.
+fn details_from_reply(body: &Value) -> Option<Value> {
+    if body.get("status").and_then(Value::as_str) != Some("success") {
+        return None;
+    }
+    match body.get("data") {
+        Some(Value::Object(record)) if !record.is_empty() => Some(Value::Object(record.clone())),
+        _ => None,
+    }
+}
+
+/// Hang `details` off the `data` object of a successful `get_card_info` body.
+///
+/// Always inserted, so a client can read `data.details` without first checking
+/// whether the key is there.
+async fn attach_student_details(log: &StepLogger, body: &mut Value) {
+    let student_reg_no = body
+        .pointer("/data/student_applicant_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let details = match student_reg_no {
+        Some(reg_no) => du_get_student_details(log, &reg_no).await,
+        None => {
+            log.step("card row carries no student_applicant_id — student details not fetched");
+            None
+        }
+    };
+
+    insert_details(body, details);
+}
+
+/// The write itself, kept apart from the lookup so it can be tested without a
+/// DU to call.
+fn insert_details(body: &mut Value, record: Option<Value>) {
+    if let Some(data) = body.get_mut("data").and_then(Value::as_object_mut) {
+        data.insert("details".to_string(), details_envelope(record));
+    }
+}
+
+/// `details` wears its OWN envelope — `status` plus `data` — rather than being
+/// the bare record or `null`.
+///
+/// Requested, and the reason is that `details` reports on a second thing that
+/// can fail independently of the card lookup. The outer `status` is about the
+/// card: `"success"` means the mapping was found and the tap is valid. The
+/// inner one is about the student record only, so a reader can tell "this card
+/// is registered and here is who holds it" from "this card is registered and
+/// DU could not tell us who" — without either answer disturbing the other.
+///
+/// `data` is ALWAYS an object, `{}` when there is nothing, which is the same
+/// promise `checking_card_reg_status` makes: read `details.data` after checking
+/// `details.status`, never a `null` check on `details` itself.
+///
+/// No `message` here on purpose. DU's prose has no stable wording, does not
+/// exist at all for a timeout, and inventing one would give clients something
+/// to match on that this service cannot keep stable. The reason a record is
+/// missing is in the step log, which is where an operator looks for it.
+fn details_envelope(record: Option<Value>) -> Value {
+    match record {
+        Some(data) => json!({ "status": "success", "data": data }),
+        None => json!({ "status": "error", "data": {} }),
     }
 }
 
@@ -697,8 +945,11 @@ async fn nfc_get_card_info_inner(
         .await;
 
     match result {
-        Ok(body) => {
+        Ok(mut body) => {
             if is_ok(&body) {
+                // After the row, never instead of it: the lookup below is
+                // best-effort and a `null` here still answers the scan.
+                attach_student_details(log, &mut body).await;
                 log.step("card found — returning 200");
                 return HttpResponse::Ok().json(body);
             }
@@ -1443,6 +1694,102 @@ async fn nfc_checking_card_reg_status_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn student_info_url_accepts_either_spelling_of_the_base() {
+        // The deployed value, which carries the `/api` prefix already.
+        assert_eq!(
+            student_info_url("http://local.duwebadmin.com/api/"),
+            "http://local.duwebadmin.com/api/get_student_info"
+        );
+        // Same URL from a base written without it — the alternative is a call
+        // to `/get_student_info`, whose 404 is indistinguishable from "no such
+        // student".
+        assert_eq!(
+            student_info_url("http://local.duwebadmin.com"),
+            "http://local.duwebadmin.com/api/get_student_info"
+        );
+        assert_eq!(
+            student_info_url("  https://ssl.du.ac.bd/API  "),
+            "https://ssl.du.ac.bd/API/get_student_info"
+        );
+    }
+
+    #[test]
+    fn an_empty_du_reply_never_reaches_the_wire_as_a_record() {
+        // A record: passed through whole.
+        let found = json!({
+            "status": "success",
+            "data": { "name": "Pothik Roy", "reg_no": "2020218753" }
+        });
+        assert_eq!(
+            details_from_reply(&found)
+                .and_then(|d| d.get("name").and_then(Value::as_str).map(str::to_string)),
+            Some("Pothik Roy".to_string())
+        );
+
+        // Everything below is "DU had nothing to say" and must read as absent,
+        // NOT as an empty record: `"details": {}` passes a client's `if
+        // (details)` check and then renders a blank name.
+        for empty in [
+            json!({ "status": "success", "data": {} }),
+            json!({ "status": "success", "data": null }),
+            json!({ "status": "success" }),
+            json!({ "status": "error", "message": "No student found for - 2017001010", "data": null }),
+            // A 200 carrying a record beside an error status is still an error.
+            json!({ "status": "error", "data": { "name": "Pothik Roy" } }),
+        ] {
+            assert_eq!(details_from_reply(&empty), None, "should be absent: {empty}");
+        }
+    }
+
+    #[test]
+    fn details_are_attached_to_the_data_object() {
+        let card = json!({
+            "status": "success",
+            "message": "Data Found",
+            "data": { "card_number": "04A1B2C3D4E5", "student_applicant_id": "2020218753" }
+        });
+
+        // DU answered: the record goes in whole, under the envelope's `data`.
+        let mut found = card.clone();
+        insert_details(&mut found, Some(json!({ "name": "Pothik Roy", "reg_no": "2020218753" })));
+        assert_eq!(
+            found.pointer("/data/details/status").and_then(Value::as_str),
+            Some("success")
+        );
+        assert_eq!(
+            found.pointer("/data/details/data/name").and_then(Value::as_str),
+            Some("Pothik Roy")
+        );
+        assert_eq!(
+            found.pointer("/data/card_number").and_then(Value::as_str),
+            Some("04A1B2C3D4E5"),
+            "the card fields must survive the insertion"
+        );
+
+        // DU did not: the envelope is still there, and `data` is still an
+        // object — `{}`, never null and never absent.
+        let mut missing = card;
+        insert_details(&mut missing, None);
+        assert_eq!(
+            missing.pointer("/data/details/status").and_then(Value::as_str),
+            Some("error")
+        );
+        assert_eq!(
+            missing.pointer("/data/details/data"),
+            Some(&json!({})),
+            "`details.data` is an object on every response, so a client reads \
+             it after one status check rather than null-checking `details`"
+        );
+
+        // The card's own status is untouched by the student lookup failing:
+        // the tap is still valid.
+        assert_eq!(
+            missing.get("status").and_then(Value::as_str),
+            Some("success")
+        );
+    }
 
     #[test]
     fn safe_file_name_keeps_ordinary_names() {
