@@ -529,12 +529,24 @@ BEGIN
      WHERE c.student_applicant_id = v_applicant
        FOR UPDATE;
 
+    -- A card is registered once. Re-saving the card a student already holds is
+    -- refused rather than treated as an update: the desk is told to use
+    -- another card, and the stored row, images and verification stay as they
+    -- are. `force_reassign` does not override this — there is nobody to take
+    -- the card from.
+    IF v_holder.id IS NOT NULL AND v_holder.student_applicant_id = v_applicant THEN
+        RETURN jsonb_build_object(
+            'status',  'error',
+            'code',    'card_exists',
+            'message', 'This card already exists. Please try another card.');
+    END IF;
+
     IF v_holder.id IS NOT NULL AND v_holder.student_applicant_id <> v_applicant THEN
         IF NOT v_force THEN
             RETURN jsonb_build_object(
                 'status',  'error',
                 'code',    'card_conflict',
-                'message', 'Card already assigned to another student',
+                'message', 'This card already exists. Please try another card.',
                 'data', jsonb_build_object(
                     'assigned_to', v_holder.student_applicant_id
                 ));
@@ -647,7 +659,7 @@ EXCEPTION
         RETURN jsonb_build_object(
             'status',  'error',
             'code',    'card_conflict',
-            'message', 'Card already assigned to another student');
+            'message', 'This card already exists. Please try another card.');
 END;
 $function$;
 

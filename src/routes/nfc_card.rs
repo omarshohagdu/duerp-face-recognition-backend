@@ -197,7 +197,7 @@ fn status_for_code(code: &str) -> actix_web::http::StatusCode {
     use actix_web::http::StatusCode;
     match code {
         "card_not_found" => StatusCode::NOT_FOUND,
-        "card_conflict" => StatusCode::CONFLICT,
+        "card_conflict" | "card_exists" => StatusCode::CONFLICT,
         _ => StatusCode::BAD_REQUEST,
     }
 }
@@ -1370,6 +1370,42 @@ async fn nfc_save_card_info_inner(
                 "You may register a card, but not reassign one already issued to another student",
             ));
         }
+    }
+
+    // ── Is this card already registered? ─────────────────────────────
+    // A card is saved once; a second save of it is refused, not applied as an
+    // update. Asked here so a repeat is answered before the face-match round
+    // trip. `attendance.nfc_card_save_info` makes the same check under a row
+    // lock and stays the authority — this read only answers early. A card held
+    // by ANOTHER student with `force_reassign` set is left to the function.
+    let holder = sqlx::query_scalar::<_, String>(
+        "SELECT student_applicant_id FROM attendance.nfc_student_cards \
+          WHERE card_number = attendance.nfc_card_normalize($1)",
+    )
+    .bind(card)
+    .fetch_optional(db.get_ref())
+    .await;
+    match holder {
+        Ok(Some(holder)) if !force_reassign || Some(holder.as_str()) == applicant => {
+            let code = if Some(holder.as_str()) == applicant {
+                "card_exists"
+            } else {
+                "card_conflict"
+            };
+            log.step(format!(
+                "card already registered (holder={holder}, code={code}) — returning 409"
+            ));
+            let mut body = fail(code, "This card already exists. Please try another card.");
+            // Same shape as the function's own `card_conflict`.
+            if code == "card_conflict" {
+                body["data"] = json!({ "assigned_to": holder });
+            }
+            return HttpResponse::Conflict().json(body);
+        }
+        Ok(_) => {}
+        // Not fatal: the function repeats the check, so a failed read here
+        // only costs the early answer.
+        Err(e) => log.step(format!("card pre-check query failed ({e}) — deferring to the save")),
     }
 
     // ── The face-match gate ──────────────────────────────────────────

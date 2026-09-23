@@ -517,8 +517,7 @@ Two consequences worth planning for:
   `get_card_info` returns, from the same SQL function, so the two endpoints can
   never word them differently.
 - `created` — `true` on the first save for an applicant id, `false` on updates.
-- `changed_fields` — which columns this write actually changed. Empty for a
-  re-save that altered nothing.
+- `changed_fields` — which columns this write actually changed.
 - `warnings` — non-fatal things the caller should see: a forced `is_verified`,
   or a card taken from another student. **Surface these in the UI**; they report
   writes that did not do what was asked.
@@ -539,6 +538,7 @@ Two consequences worth planning for:
 | 400 | `face_mismatch` | The two photos are different people. `data` carries `similarity`, `threshold` and the service's own `detail` |
 | 400 | `face_not_comparable` | The service could not compare them — usually no detectable face in one. Its wording is passed through as the `message` |
 | 400 | `bad_multipart` | Malformed multipart body |
+| 409 | `card_exists` | Card is already registered to **this** student — a card is saved once; nothing is updated, even with `force_reassign` |
 | 409 | `card_conflict` | Card is assigned to a **different** student — `data.assigned_to` names them |
 | 413 | `image_too_large` | An image exceeds `WOW_MAX_UPLOAD_MB` (default 25 MB) |
 | 401 / 403 | — | Auth layers above |
@@ -735,7 +735,7 @@ By default, presenting a card that belongs to someone else is a **`409`**:
 {
   "status": "error",
   "code": "card_conflict",
-  "message": "Card already assigned to another student",
+  "message": "This card already exists. Please try another card.",
   "data": { "assigned_to": "APP-2026-00123" }
 }
 ```
@@ -1147,9 +1147,9 @@ curl -s "${AUTH[@]}" -X POST "$BASE/ext-api/nfc-card/save_card_info" \
   -F "card_image=@card.jpg" \
   -F "student_selfie=@selfie.jpg"
 
-# Mark an existing record verified — still needs both photos, because a save
-# with no files cannot be face-checked. Sending them again is harmless: the
-# upsert is on student_applicant_id, so this updates the row rather than adding one.
+# Saving the same card a second time is refused and changes nothing:
+#   409 {"status":"error","code":"card_exists",
+#        "message":"This card already exists. Please try another card."}
 curl -s "${AUTH[@]}" -X POST "$BASE/ext-api/nfc-card/save_card_info" \
   -F "student_applicant_id=APP-2026-00123" \
   -F "card_number=04A1B2C3D4E5" \

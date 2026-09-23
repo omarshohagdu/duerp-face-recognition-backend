@@ -721,7 +721,7 @@ async fn a_student_whose_card_was_reissued_is_no_longer_registered() {
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_second_save_updates_the_same_row() {
+async fn a_second_save_of_the_same_card_is_refused() {
     let pool = db_or_skip!();
     let mut tx = pool.begin().await.expect("begin");
     let (applicant, card) = fixture_ids();
@@ -729,10 +729,14 @@ async fn a_second_save_updates_the_same_row() {
     let first = save_admin(&mut tx, &applicant, &card).await;
     assert_eq!(data(&first, "created"), true);
 
-    let second = save_admin(&mut tx, &applicant, &card).await;
-    assert_eq!(data(&second, "created"), false);
+    // A card is registered once: saving it again is refused, not an update.
+    let second = save(&mut tx, &applicant, Some(&card), Some(2), Some(1), None, None, false).await;
+    assert!(!ok(&second), "{second}");
+    assert_eq!(code(&second), "card_exists");
+    assert_eq!(message(&second), "This card already exists. Please try another card.");
 
-    // One student, one card record — a repeated save is not a second row.
+    // The stored row is untouched — still verified, still one row.
+    assert_eq!(data(&get_info(&mut tx, Some(&card)).await, "is_verified"), 1);
     let rows: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM attendance.nfc_student_cards WHERE student_applicant_id = $1",
     )
@@ -763,9 +767,11 @@ async fn omitting_an_image_keeps_the_stored_one() {
     )
     .await;
 
-    // The verification step: an admin flipping is_verified sends no files, and
-    // must not thereby wipe the images the previous save uploaded.
-    let verified = save(&mut tx, &applicant, Some(&card), Some(1), Some(1), None, None, false).await;
+    // A later save for the same student — with a new card, since the same one
+    // is refused — sends no files, and must not thereby wipe the images the
+    // previous save uploaded.
+    let (_, new_card) = fixture_ids();
+    let verified = save(&mut tx, &applicant, Some(&new_card), Some(1), Some(1), None, None, false).await;
 
     assert!(ok(&verified));
     assert_eq!(data(&verified, "is_verified"), 1);
@@ -791,10 +797,11 @@ async fn a_supplied_image_replaces_the_stored_one() {
     )
     .await;
 
+    let (_, new_card) = fixture_ids();
     let replaced = save(
         &mut tx,
         &applicant,
-        Some(&card),
+        Some(&new_card),
         Some(1),
         Some(1),
         Some("/app/uploads/nfc_card/cards/new.jpg"),
@@ -893,9 +900,11 @@ async fn a_later_checked_save_clears_the_not_face_checked_state() {
     save_gated(&mut tx, &applicant, Some(&card), Some(1), Some(1), None, None, false, false).await;
     assert_eq!(data(&get_info(&mut tx, Some(&card)).await, "is_verified"), 0);
 
-    // Turning the gate back on and re-saving is how a card leaves that state —
-    // it is not sticky, it is a record of what happened at write time.
-    let again = save(&mut tx, &applicant, Some(&card), Some(1), Some(1), None, None, false).await;
+    // Turning the gate back on and saving again — with a new card, since the
+    // same one is refused — records the new state: 0 is not sticky, it is a
+    // record of what happened at write time.
+    let (_, new_card) = fixture_ids();
+    let again = save(&mut tx, &applicant, Some(&new_card), Some(1), Some(1), None, None, false).await;
     assert!(ok(&again));
     assert_eq!(data(&again, "is_verified"), 1);
 }
@@ -942,6 +951,7 @@ async fn a_card_held_by_another_student_is_refused() {
 
     assert!(!ok(&refused));
     assert_eq!(code(&refused), "card_conflict");
+    assert_eq!(message(&refused), "This card already exists. Please try another card.");
     // Naming the current holder is what lets a desk resolve the clash without
     // a DBA; without it the operator only knows "someone".
     assert_eq!(data(&refused, "assigned_to"), first_student.as_str());
@@ -958,16 +968,19 @@ async fn a_card_held_by_another_student_is_refused() {
 }
 
 #[tokio::test]
-async fn the_same_student_resaving_their_own_card_is_not_a_conflict() {
+async fn the_same_student_resaving_their_own_card_is_refused_even_when_forced() {
     let pool = db_or_skip!();
     let mut tx = pool.begin().await.expect("begin");
     let (applicant, card) = fixture_ids();
 
     save_admin(&mut tx, &applicant, &card).await;
-    // Idempotent, per the spec: re-scanning the card you already hold is an
-    // update, not someone else's card.
-    let again = save_admin(&mut tx, &applicant, &card).await;
-    assert!(ok(&again), "resave should succeed: {again}");
+    // Not someone else's card, so not `card_conflict` — and `force_reassign`
+    // has nobody to take it from, so it does not turn this into an update.
+    let again = save(&mut tx, &applicant, Some(&card), Some(1), Some(1), None, None, true).await;
+    assert!(!ok(&again), "{again}");
+    assert_eq!(code(&again), "card_exists");
+    assert_eq!(message(&again), "This card already exists. Please try another card.");
+    assert_eq!(audit_for(&mut tx, &applicant).await.len(), 1);
 }
 
 #[tokio::test]
@@ -1158,16 +1171,18 @@ async fn every_write_leaves_an_audit_row() {
     assert_eq!(rows[0].0, "created");
     assert!(rows[0].1.contains(&"card_number".to_string()));
 
+    // A refused re-save of the same card writes nothing...
     save_admin(&mut tx, &applicant, &card).await;
+    assert_eq!(audit_for(&mut tx, &applicant).await.len(), 1);
+
+    // ...a new card for the same student is an update, and only what differed
+    // is recorded as changed.
+    let (_, new_card) = fixture_ids();
+    save_admin(&mut tx, &applicant, &new_card).await;
     let rows = audit_for(&mut tx, &applicant).await;
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[1].0, "updated");
-    // Nothing actually differed, so the row must not claim a change.
-    assert!(
-        rows[1].1.is_empty(),
-        "a no-op save should record no changed fields, got {:?}",
-        rows[1].1
-    );
+    assert_eq!(rows[1].1, vec!["card_number".to_string()]);
 }
 
 #[tokio::test]
