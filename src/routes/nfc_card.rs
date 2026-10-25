@@ -469,7 +469,7 @@ fn details_envelope(record: Option<Value>) -> Value {
 /// Sent as `X-API-Key`. A missing key is forwarded as an empty header rather
 /// than omitted, so the failure surfaces as the service's own 401 in the step
 /// log instead of as a differently-shaped request.
-fn face_verify_api_key() -> String {
+pub(crate) fn face_verify_api_key() -> String {
     std::env::var("NFC_FACE_VERIFY_API_KEY").unwrap_or_default()
 }
 
@@ -489,7 +489,7 @@ fn face_verify_timeout() -> Duration {
 
 /// Shared client for the face-match service: connection + TLS reuse across
 /// saves, and the timeout applied in one place.
-static FACE_VERIFY_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+pub(crate) static FACE_VERIFY_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(face_verify_timeout())
         .build()
@@ -508,7 +508,7 @@ fn face_verify_unavailable(message: &str) -> HttpResponse {
 /// name is client text, and `reduce_saved_image` may have re-encoded the file
 /// to JPEG without the extension following. The receiving service parses the
 /// part's filename, so it gets a plain ASCII one.
-fn forward_name_and_mime(field: &str, head: &[u8]) -> (String, &'static str) {
+pub(crate) fn forward_name_and_mime(field: &str, head: &[u8]) -> (String, &'static str) {
     let (ext, mime) = match detect_image_format(head) {
         "PNG" => ("png", "image/png"),
         "WEBP" => ("webp", "image/webp"),
@@ -522,7 +522,7 @@ fn forward_name_and_mime(field: &str, head: &[u8]) -> (String, &'static str) {
 }
 
 /// Read a stored upload back off disk as a multipart part.
-async fn forward_part(field: &str, path: &str) -> Result<reqwest::multipart::Part, String> {
+pub(crate) async fn forward_part(field: &str, path: &str) -> Result<reqwest::multipart::Part, String> {
     let bytes = tokio::fs::read(path)
         .await
         .map_err(|e| format!("read {path}: {e}"))?;
@@ -539,7 +539,7 @@ async fn forward_part(field: &str, path: &str) -> Result<reqwest::multipart::Par
 /// `{msg: …}` for a schema error — and `message`, the prose beside `match`.
 /// Worth passing on, because "No face detected in 'card_image'" tells a
 /// student to retake the photo and a generic message would not.
-fn face_verify_message(body: &Value) -> Option<String> {
+pub(crate) fn face_verify_message(body: &Value) -> Option<String> {
     match body.get("detail") {
         Some(Value::String(s)) if !s.trim().is_empty() => return Some(s.trim().to_string()),
         Some(Value::Array(items)) => {
@@ -1452,6 +1452,21 @@ async fn nfc_save_card_info_inner(
         verify_card_selfie_match(log, gate.url.as_deref(), &card_img.path, &selfie_img.path).await
     {
         return resp;
+    }
+
+    // ── Match with EIS ───────────────────────────────────────────────
+    // The card number is the student's EIS studentship token, so the selfie
+    // that just matched the card photo is also compared with the photo EIS
+    // holds for this card (routes::eis_match). Its own admin switch; OFF is a
+    // logged no-op. Before the write, for the same reason as the gate above.
+    if let Err(r) =
+        crate::routes::eis_match::check_card(log, db.get_ref(), card.unwrap_or(""), &selfie_img.path).await
+    {
+        let mut body = fail(r.code, r.message);
+        if let Some(data) = r.data {
+            body["data"] = data;
+        }
+        return HttpResponse::build(r.status).json(body);
     }
 
     let stored_paths: Vec<&str> = [card_image.as_ref(), student_selfie.as_ref()]

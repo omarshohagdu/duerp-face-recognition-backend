@@ -213,6 +213,8 @@ async fn main() -> std::io::Result<()> {
                     )
                     .service(routes::settings::get_nfc_face_verify) // GET /ext-api/settings/nfc-face-verify
                     .service(routes::settings::put_nfc_face_verify) // PUT /ext-api/settings/nfc-face-verify
+                    .service(routes::settings::get_eis_match)       // GET /ext-api/settings/eis-match
+                    .service(routes::settings::put_eis_match)       // PUT /ext-api/settings/eis-match
             )
             // Admin-managed runtime settings. A SEPARATE scope because the
             // admin panel asked for this path — but wrapped in the SAME gate,
@@ -232,6 +234,8 @@ async fn main() -> std::io::Result<()> {
                     )
                     .service(routes::settings::get_nfc_face_verify) // GET  /admin-api/settings/nfc-face-verify
                     .service(routes::settings::put_nfc_face_verify) // PUT  /admin-api/settings/nfc-face-verify (json: nfc_face_verify, nfc_face_verify_url?)
+                    .service(routes::settings::get_eis_match)       // GET  /admin-api/settings/eis-match
+                    .service(routes::settings::put_eis_match)       // PUT  /admin-api/settings/eis-match (json: eis_match, eis_match_url?)
             )
     })
     .bind((bind_addr, port))?

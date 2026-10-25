@@ -1578,6 +1578,22 @@ async fn wow_enroll_inner(
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok());
 
+    // "Match with EIS" (admin setting): every enroll image against the photo
+    // on the student's EIS studentship page, found through their registered
+    // card. BEFORE the AI platform learns the face, so a refusal leaves
+    // nothing enrolled anywhere. OFF, or an employee, is a logged no-op
+    // (routes::eis_match).
+    if let Err(r) =
+        crate::routes::eis_match::check_enroll(log, db.get_ref(), &id, &id_type, &image_paths).await
+    {
+        log.step(format!("EIS match refused the enroll ({}) — kept {} uploaded image(s)", r.code, image_paths.len()));
+        let mut body = json!({ "success": false, "code": r.code, "message": r.message });
+        if let Some(data) = r.data {
+            body["data"] = data;
+        }
+        return HttpResponse::build(r.status).json(body);
+    }
+
     // Forward the captured images to the AI platform FIRST so it can learn the
     // face. Only when the platform accepts the enrollment do we touch the DB —
     // a failed AI enroll must leave the enrollment table unchanged. The

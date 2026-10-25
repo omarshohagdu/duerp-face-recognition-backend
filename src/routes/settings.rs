@@ -1,11 +1,15 @@
-//! Admin settings API — the NFC face-verification toggle.
+//! Admin settings API — the NFC face-verification toggle and the
+//! "Match with EIS" toggle.
 //!
 //!   GET /admin-api/settings/nfc-face-verify
 //!   PUT /admin-api/settings/nfc-face-verify
+//!   GET /admin-api/settings/eis-match
+//!   PUT /admin-api/settings/eis-match
 //!
-//! What the admin panel binds a switch and a text box to. The values live in
+//! What the admin panel binds a switch and a text box to, once per pair. The values live in
 //! `attendance.system_settings`; the rules, the validation and the audit rows
-//! are in `sql/008_system_settings.sql`, so a psql caller gets the same
+//! are in `sql/008_system_settings.sql` (and `sql/009_eis_match_settings.sql`
+//! for EIS), so a psql caller gets the same
 //! answers.
 //!
 //! WHY `/admin-api` AND NOT `/ext-api`
@@ -166,8 +170,8 @@ pub fn json_error_handler(
     .into()
 }
 
-fn logger(req: &actix_web::HttpRequest) -> StepLogger {
-    let log = StepLogger::new("admin-api/settings/nfc-face-verify");
+fn logger(req: &actix_web::HttpRequest, name: &str) -> StepLogger {
+    let log = StepLogger::new(name);
     log.set_base_url(&public_base_url(req));
     log.set_endpoint(req.method().as_str(), &full_path(req));
     log.params("query", &query_to_json(req.query_string()));
@@ -183,7 +187,7 @@ pub async fn get_nfc_face_verify(
     req: actix_web::HttpRequest,
     db: web::Data<PgPool>,
 ) -> HttpResponse {
-    let log = logger(&req);
+    let log = logger(&req, "admin-api/settings/nfc-face-verify");
     let resp = get_inner(&log, &req, &db).await;
     log_local_response(&log, resp).await
 }
@@ -255,7 +259,7 @@ pub async fn put_nfc_face_verify(
     db: web::Data<PgPool>,
     body: web::Json<UpdateRequest>,
 ) -> HttpResponse {
-    let log = logger(&req);
+    let log = logger(&req, "admin-api/settings/nfc-face-verify");
     log.params("json", &serde_json::to_value(&*body).unwrap_or(Value::Null));
     let resp = put_inner(&log, &req, &db, body).await;
     log_local_response(&log, resp).await
@@ -329,6 +333,133 @@ async fn put_inner(
     }
 }
 
+// ---------------------------------------------------------------------
+// Match with EIS — the same shape as the face toggle, minus `effective`:
+// nothing ever read these from the environment, so the stored rows are the
+// whole truth and there is no second answer to show.
+// ---------------------------------------------------------------------
+
+#[get("/settings/eis-match")]
+pub async fn get_eis_match(req: actix_web::HttpRequest, db: web::Data<PgPool>) -> HttpResponse {
+    let log = logger(&req, "admin-api/settings/eis-match");
+    let resp = eis_get_inner(&log, &req, &db).await;
+    log_local_response(&log, resp).await
+}
+
+async fn eis_get_inner(
+    log: &StepLogger,
+    req: &actix_web::HttpRequest,
+    db: &web::Data<PgPool>,
+) -> HttpResponse {
+    if let Err(resp) = require_admin(log, req, db).await {
+        return resp;
+    }
+
+    match sqlx::query_scalar::<_, Value>("SELECT attendance.eis_match_get()")
+        .fetch_one(db.get_ref())
+        .await
+    {
+        Ok(body) => {
+            log.step("settings read");
+            let data = body.get("data").cloned().unwrap_or_else(|| json!({}));
+            HttpResponse::Ok().json(json!({ "success": true, "data": data }))
+        }
+        Err(err) => {
+            eprintln!("DB error reading eis-match settings: {err}");
+            log.step(format!("DB read FAILED: {err}"));
+            fail(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "Internal server error",
+            )
+        }
+    }
+}
+
+#[derive(Deserialize, serde::Serialize)]
+pub struct EisUpdateRequest {
+    pub eis_match: String,
+    /// Absent leaves the stored URL alone; `""` clears it — as for the face
+    /// toggle.
+    #[serde(default)]
+    pub eis_match_url: Option<String>,
+}
+
+#[put("/settings/eis-match")]
+pub async fn put_eis_match(
+    req: actix_web::HttpRequest,
+    db: web::Data<PgPool>,
+    body: web::Json<EisUpdateRequest>,
+) -> HttpResponse {
+    let log = logger(&req, "admin-api/settings/eis-match");
+    log.params("json", &serde_json::to_value(&*body).unwrap_or(Value::Null));
+    let resp = eis_put_inner(&log, &req, &db, body).await;
+    log_local_response(&log, resp).await
+}
+
+async fn eis_put_inner(
+    log: &StepLogger,
+    req: &actix_web::HttpRequest,
+    db: &web::Data<PgPool>,
+    body: web::Json<EisUpdateRequest>,
+) -> HttpResponse {
+    let client_ip = req
+        .connection_info()
+        .realip_remote_addr()
+        .unwrap_or("")
+        .to_string();
+
+    let person_id = match require_admin(log, req, db).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    let result = sqlx::query_scalar::<_, Value>("SELECT attendance.eis_match_save($1, $2, $3, $4)")
+        .bind(&body.eis_match)
+        .bind(body.eis_match_url.as_deref())
+        .bind(person_id)
+        .bind(&client_ip)
+        .fetch_one(db.get_ref())
+        .await;
+
+    match result {
+        Ok(out) => {
+            if out.get("status").and_then(Value::as_str) != Some("success") {
+                let code = out.get("code").and_then(Value::as_str).unwrap_or("");
+                let message = out
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Invalid request");
+                log.step(format!("rejected ({code})"));
+                return fail(status_for(code), code, message);
+            }
+
+            // Before answering, for the reason given in `put_inner`.
+            settings::invalidate();
+
+            let data = out.get("data").cloned().unwrap_or_else(|| json!({}));
+            log.step(format!(
+                "settings updated by person {person_id}: eis_match={} — cache invalidated",
+                data.get("eis_match").and_then(Value::as_str).unwrap_or("?")
+            ));
+            HttpResponse::Ok().json(json!({
+                "success": true,
+                "message": "Settings updated",
+                "data":    data,
+            }))
+        }
+        Err(err) => {
+            eprintln!("DB error writing eis-match settings: {err}");
+            log.step(format!("DB write FAILED: {err}"));
+            fail(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "Internal server error",
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,5 +495,18 @@ mod tests {
         // The toggle itself is mandatory — a PUT with no state to set is a
         // client bug, and actix answers it with a 400 before the handler runs.
         assert!(serde_json::from_str::<UpdateRequest>(r#"{"nfc_face_verify_url":"https://x"}"#).is_err());
+    }
+
+    #[test]
+    fn the_eis_body_has_the_same_url_semantics() {
+        let only_toggle: EisUpdateRequest =
+            serde_json::from_str(r#"{"eis_match":"ON"}"#).expect("parses");
+        assert!(only_toggle.eis_match_url.is_none());
+
+        let clearing: EisUpdateRequest =
+            serde_json::from_str(r#"{"eis_match":"OFF","eis_match_url":""}"#).expect("parses");
+        assert_eq!(clearing.eis_match_url.as_deref(), Some(""));
+
+        assert!(serde_json::from_str::<EisUpdateRequest>(r#"{"eis_match_url":"https://x"}"#).is_err());
     }
 }

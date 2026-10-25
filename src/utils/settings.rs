@@ -1,7 +1,8 @@
 //! Admin-managed runtime settings, and the cache in front of them.
 //!
-//! One setting pair today — the NFC face-verification gate — read on the hot
-//! path by `routes::nfc_card` and written by `routes::settings`.
+//! Two setting pairs — the NFC face-verification gate, read on the hot path by
+//! `routes::nfc_card`, and "Match with EIS", read by the enroll route in
+//! `routes::wow_attendance`. Both are written by `routes::settings`.
 //!
 //! WHY THERE IS A CACHE AT ALL
 //! These used to be environment variables, which cost nothing to read. Moving
@@ -52,10 +53,26 @@ pub struct FaceVerify {
 static CACHE: LazyLock<RwLock<Option<(Instant, FaceVerify)>>> =
     LazyLock::new(|| RwLock::new(None));
 
-/// Drop the cached value. Called by the settings API after every successful
-/// write, so the next read in this process is fresh.
+/// "Match with EIS" as the enroll route wants it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EisMatch {
+    /// Should an enroll compare its images with the EIS studentship photo?
+    pub enabled: bool,
+    /// The EIS studentship page to take the photo from. `None` when unset.
+    pub url: Option<String>,
+}
+
+static EIS_CACHE: LazyLock<RwLock<Option<(Instant, EisMatch)>>> =
+    LazyLock::new(|| RwLock::new(None));
+
+/// Drop the cached values — both pairs, because one write path serves both and
+/// a missed invalidation is a stale switch. Called by the settings API after
+/// every successful write, so the next read in this process is fresh.
 pub fn invalidate() {
     if let Ok(mut guard) = CACHE.write() {
+        *guard = None;
+    }
+    if let Ok(mut guard) = EIS_CACHE.write() {
         *guard = None;
     }
 }
@@ -151,6 +168,50 @@ pub async fn face_verify(db: &PgPool) -> FaceVerify {
     settings
 }
 
+/// Turn the EIS row-pair into the effective configuration. No environment
+/// fallback: nothing read these from `.env` before the table did.
+fn resolve_eis(row_value: Option<&str>, row_url: Option<&str>) -> EisMatch {
+    let url = row_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let enabled = row_value
+        .map(|v| v.trim().eq_ignore_ascii_case("ON"))
+        .unwrap_or(false);
+    EisMatch { enabled, url }
+}
+
+/// The current EIS configuration, from cache when it is fresh.
+///
+/// `Err` when the setting cannot be read. Unlike the face gate there is no
+/// environment to fall back on, and reading it as OFF would let a checked
+/// "Match with EIS" box be skipped by a database blip — the box means the
+/// comparison is MANDATORY, so the caller refuses instead. Errors are not
+/// cached: the next request tries again.
+pub async fn eis_match(db: &PgPool) -> Result<EisMatch, String> {
+    if let Ok(guard) = EIS_CACHE.read() {
+        if let Some((at, cached)) = guard.as_ref() {
+            if at.elapsed() < TTL {
+                return Ok(cached.clone());
+            }
+        }
+    }
+
+    let (value, url) = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        "SELECT (SELECT value FROM attendance.system_settings WHERE key = 'EIS_MATCH'),
+                (SELECT value FROM attendance.system_settings WHERE key = 'EIS_MATCH_URL')",
+    )
+    .fetch_one(db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let settings = resolve_eis(value.as_deref(), url.as_deref());
+    if let Ok(mut guard) = EIS_CACHE.write() {
+        *guard = Some((Instant::now(), settings.clone()));
+    }
+    Ok(settings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +267,17 @@ mod tests {
         // saved, and watch the service keep calling the old one.
         let s = resolve_with(Some("ON"), Some("https://stored.du.ac.bd/verify"), true, Some(ENV.into()));
         assert_eq!(s.url.as_deref(), Some("https://stored.du.ac.bd/verify"));
+    }
+
+    #[test]
+    fn eis_match_is_on_only_when_the_row_says_on() {
+        let url = Some(" https://academic.eis.du.ac.bd/en/studentship/x ");
+        let on = resolve_eis(Some("on"), url);
+        assert!(on.enabled);
+        assert_eq!(on.url.as_deref(), Some("https://academic.eis.du.ac.bd/en/studentship/x"));
+        assert!(!resolve_eis(Some("OFF"), url).enabled);
+        assert!(!resolve_eis(None, None).enabled);
+        assert_eq!(resolve_eis(Some("ON"), Some("  ")).url, None);
     }
 
     #[test]
