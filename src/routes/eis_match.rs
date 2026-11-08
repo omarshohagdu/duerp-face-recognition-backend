@@ -73,6 +73,19 @@ fn unavailable(message: &str) -> EisRejection {
     }
 }
 
+/// A failed match, as the caller sees it. Used for a real `match: false` AND
+/// for every case where no verdict could be had from EIS or the face-match
+/// service: with the box checked the comparison is mandatory, and "could not
+/// compare" is answered as "does not match". `reason` keeps the real cause.
+fn mismatch(outcome: &str, reason: &str) -> EisRejection {
+    EisRejection {
+        status: StatusCode::BAD_REQUEST,
+        code: "eis_face_mismatch",
+        message: format!("The selfie does not match the EIS studentship image; {outcome}"),
+        data: Some(json!({ "match": false, "reason": reason })),
+    }
+}
+
 /// The studentship page for one card. `None` for a card number that is not a
 /// plain token — it goes into a URL path, so `/`, `?`, `..` and the like must
 /// never reach EIS as part of someone else's address.
@@ -244,14 +257,11 @@ async fn check(
         log.step("EIS match is ON with no EIS_MATCH_URL — refusing (fails closed)");
         return Err(unavailable(&format!("EIS matching is on but no EIS URL is configured; {outcome}")));
     };
+    // Not a plain token: EIS is never asked (the value would go into a URL
+    // path), and with no EIS image there is no match — answered as one.
     let Some(page_url) = studentship_url(&base, card_number) else {
-        log.step("card number is not a plain EIS token — refusing");
-        return Err(EisRejection {
-            status: StatusCode::BAD_REQUEST,
-            code: "eis_invalid_card_number",
-            message: format!("The card number is not a valid EIS studentship token; {outcome}"),
-            data: None,
-        });
+        log.step(format!("card number {card_number:?} is not a plain EIS token — refusing as a mismatch"));
+        return Err(mismatch(outcome, "invalid_card_number"));
     };
     let Some(face_url) = settings::face_verify(db).await.url else {
         log.step("EIS match is ON with no face-match service URL — refusing (fails closed)");
@@ -261,37 +271,49 @@ async fn check(
     log.step(format!("EIS match: fetching studentship page GET {page_url}"));
     let html = match EIS_CLIENT.get(&page_url).send().await {
         Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
-        // EIS answers an unknown token with a bare 500, the same as a real
-        // fault, so the two cannot be told apart — the message names both.
+        // EIS answers an unknown token with a bare 500. To the caller that is
+        // a failed match — no EIS image for this card means the selfie does
+        // not match one — so it answers exactly as a mismatch does. The step
+        // log and `data.reason` keep the real cause for whoever investigates.
         Ok(r) => {
             log.step(format!(
-                "EIS page answered {} — unknown card number or EIS fault; refusing",
+                "EIS page answered {} — unknown card number or EIS fault; refusing as a mismatch",
                 r.status().as_u16()
             ));
             return Err(EisRejection {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                code: "eis_lookup_failed",
-                message: format!("EIS has no studentship record for this card number, or EIS is unavailable; {outcome}"),
-                data: None,
+                status: StatusCode::BAD_REQUEST,
+                code: "eis_face_mismatch",
+                message: format!("The selfie does not match the EIS studentship image; {outcome}"),
+                data: Some(json!({
+                    "match":      false,
+                    "reason":     "eis_record_not_found",
+                    "eis_status": r.status().as_u16(),
+                })),
             });
         }
+        // Unreachable or timed out: no EIS image, so no match — answered as one.
         Err(e) => {
-            log.step(format!("EIS page request FAILED: {e}"));
-            return Err(unavailable(&format!("EIS is unavailable; {outcome}")));
+            log.step(format!("EIS page request FAILED: {e} — refusing as a mismatch"));
+            return Err(mismatch(outcome, "eis_unavailable"));
         }
     };
     // The page is one student's personal record, so it is not logged — only
     // what came of reading it.
+    // No image to compare with is a failed match, answered exactly as one —
+    // the same rule as an unknown card above. `data.reason` keeps the cause.
     let Some(photo) = photo_from_page(&html) else {
         log.step(format!(
-            "EIS page ({} bytes) carried no photo — unknown card number, or EIS changed its page",
+            "EIS page ({} bytes) carried no photo — unknown card number, or EIS changed its page; refusing as a mismatch",
             html.len()
         ));
         return Err(EisRejection {
             status: StatusCode::BAD_REQUEST,
-            code: "eis_no_photo",
-            message: format!("No EIS studentship photo was found for this card number; {outcome}"),
-            data: None,
+            code: "eis_face_mismatch",
+            message: format!("The selfie does not match the EIS studentship image; {outcome}"),
+            data: Some(json!({
+                "match":  false,
+                "reason": "eis_no_photo",
+            })),
         });
     };
     log.step(format!("EIS photo extracted ({} bytes)", photo.len()));
@@ -345,8 +367,8 @@ async fn compare(
     {
         Ok(r) => r,
         Err(e) => {
-            log.step(format!("face-match request FAILED: {e}"));
-            return Err(unavailable(&format!("Face-match service is unavailable; {outcome}")));
+            log.step(format!("face-match request FAILED: {e} — refusing as a mismatch"));
+            return Err(mismatch(outcome, "face_service_unavailable"));
         }
     };
 
@@ -354,24 +376,30 @@ async fn compare(
     let raw = resp.text().await.unwrap_or_default();
     let Ok(body) = serde_json::from_str::<Value>(&raw) else {
         log.ai_response("/verify (eis)", status.as_u16(), &json!({ "non_json_body": raw }));
-        return Err(unavailable(&format!("Face-match service returned an unreadable response; {outcome}")));
+        log.step("face-match reply was not JSON — refusing as a mismatch");
+        return Err(mismatch(outcome, "face_service_unavailable"));
     };
     log.ai_response("/verify (eis)", status.as_u16(), &body);
 
     if matches!(status.as_u16(), 401 | 403) || status.is_server_error() {
-        log.step(format!("face-match service failed ({}) — refusing", status.as_u16()));
-        return Err(unavailable(&format!("Face-match service is unavailable; {outcome}")));
+        log.step(format!("face-match service failed ({}) — refusing as a mismatch", status.as_u16()));
+        return Err(mismatch(outcome, "face_service_unavailable"));
     }
+    // Read but not comparable — usually no detectable face in one photo. A
+    // mismatch to the caller like every other no-verdict case; the service's
+    // own wording ("No face detected in …") rides along in `data.detail`.
     if status.is_client_error() {
-        let message = face_verify_message(&body)
-            .unwrap_or_else(|| format!("The {label} could not be compared with the EIS photo"));
-        log.step(format!("{label} and EIS photo could not be compared ({}) — returning 400", status.as_u16()));
-        return Err(EisRejection {
-            status: StatusCode::BAD_REQUEST,
-            code: "eis_face_not_comparable",
-            message,
-            data: None,
-        });
+        let detail = face_verify_message(&body);
+        log.step(format!(
+            "{label} and EIS photo could not be compared ({}: {}) — refusing as a mismatch",
+            status.as_u16(),
+            detail.as_deref().unwrap_or("no detail")
+        ));
+        let mut r = mismatch(outcome, "face_not_comparable");
+        if let Some(data) = r.data.as_mut() {
+            data["detail"] = json!(detail);
+        }
+        return Err(r);
     }
 
     let null = Value::Null;
@@ -396,8 +424,8 @@ async fn compare(
             })),
         }),
         None => {
-            log.step("face-match reply carried no `match` field — refusing");
-            Err(unavailable(&format!("Face-match service returned an unexpected response; {outcome}")))
+            log.step("face-match reply carried no `match` field — refusing as a mismatch");
+            Err(mismatch(outcome, "face_service_unavailable"))
         }
     }
 }
