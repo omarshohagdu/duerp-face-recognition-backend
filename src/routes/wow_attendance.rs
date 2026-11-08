@@ -331,11 +331,11 @@ async fn du_get_employee(person_id: &str) -> Result<DuLookup, String> {
 // cannot be positively identified as a Student here; that is what keeps the
 // `X-Id-Type` / `WOW_IDTYPE_FALLBACK` fallback alive. Once the student endpoint
 // exists, resolve "Student" from it and drop the fallback.
-struct Identified {
+pub(crate) struct Identified {
     // The `id` belongs to the token holder, so the request may proceed.
-    owned: bool,
+    pub(crate) owned: bool,
     // DU confirmed `id` is an employee — `id_type` follows from that, no fallback.
-    is_employee: bool,
+    pub(crate) is_employee: bool,
 }
 
 // Decide whether `id` belongs to the holder of the token, and what kind of person
@@ -355,7 +355,7 @@ struct Identified {
 // A DU lookup that fails leaves only the direct match: authorization fails closed
 // (a legacy-token caller cannot enroll by `emp_id` while DU is down), but the
 // `id_type` fallback still keeps a plain self-enroll working.
-async fn du_identify(id: &str, token_user_id: i64, log: &StepLogger) -> Identified {
+pub(crate) async fn du_identify(id: &str, token_user_id: i64, log: &StepLogger) -> Identified {
     let direct = id.trim() == token_user_id.to_string();
 
     match du_get_employee(id).await {
@@ -435,7 +435,7 @@ fn header_or_env_id_type(req: &actix_web::HttpRequest) -> Option<String> {
 // match; enroll: the id being enrolled). `ai_requested_id` (the AI platform's
 // request_id) and `ai_similarity` come from the AI response and are None on
 // flows that never called the AI (enroll rejects before any AI call).
-async fn record_token_mismatch(
+pub(crate) async fn record_token_mismatch(
     db: &PgPool,
     action: &str,
     ai_recognized_id: &str,
@@ -472,7 +472,7 @@ async fn record_token_mismatch(
 // key spellings phones send (`device_lat` / `lat` / `latitude`), so a client
 // that already reports coordinates in `device_info` needs no change. Returns
 // None unless BOTH coordinates are present and in range.
-fn device_coords(device: Option<&Value>) -> Option<(f64, f64)> {
+pub(crate) fn device_coords(device: Option<&Value>) -> Option<(f64, f64)> {
     let device = device?;
     let num = |keys: &[&str]| -> Option<f64> {
         keys.iter().find_map(|k| {
@@ -499,7 +499,7 @@ fn device_coords(device: Option<&Value>) -> Option<(f64, f64)> {
 // Same tolerance for spellings as `device_coords`. Absent is NOT a failure:
 // existing clients do not send it, and the accuracy limit only applies to
 // devices that report one (see GEO_MAX_GPS_ACCURACY_METERS in sql/010).
-fn device_accuracy(device: Option<&Value>) -> Option<f64> {
+pub(crate) fn device_accuracy(device: Option<&Value>) -> Option<f64> {
     let device = device?;
     ["accuracy_meters", "accuracy", "gps_accuracy", "horizontal_accuracy"]
         .iter()
@@ -521,11 +521,11 @@ fn upload_base() -> String {
         .unwrap_or_else(|| "./uploads/wow_attendance".to_string())
 }
 
-fn enrolled_dir() -> String {
+pub(crate) fn enrolled_dir() -> String {
     format!("{}/enrolled/", upload_base().trim_end_matches('/'))
 }
 
-fn live_dir() -> String {
+pub(crate) fn live_dir() -> String {
     format!("{}/live/", upload_base().trim_end_matches('/'))
 }
 

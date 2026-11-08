@@ -161,6 +161,11 @@ async fn main() -> std::io::Result<()> {
                     .service(routes::wow_attendance::wow_ssl_image_verify)  // POST /ext-api/wow-attendance/ssl_image_verfiy (images: multiple file)
                     .service(routes::wow_attendance::wow_verify)         // POST /ext-api/wow-attendance/verify?id=&id_type=
                     .service(routes::wow_attendance::wow_mapping_save)   // POST /ext-api/wow-attendance/mapping-save (json: body_code, building_id|building_name, lat, long, radius)
+                    // Selfie enrollment + selfie attendance: 1:1 check against the
+                    // enrolled selfie by the face-verify service (NFC_FACE_VERIFY_URL)
+                    // and an approved-office GPS check. src/routes/face_attendance.rs.
+                    .service(routes::face_attendance::face_enroll) // POST /ext-api/face-attendance/enroll (multipart: employee_id, employee_selfie_image, device_info?)
+                    .service(routes::face_attendance::face_mark)   // POST /ext-api/face-attendance/mark   (multipart: employee_id, selfie_image, device_info with GPS)
                     // Readers for the two step-log folders. They sit here
                     // rather than on their own scope so they inherit the
                     // app-credential + IP allow-list gate every other ext-api

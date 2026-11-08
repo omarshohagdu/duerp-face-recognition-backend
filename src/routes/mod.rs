@@ -2,6 +2,7 @@ pub mod access;
 pub mod access_admin;
 pub mod auth;
 pub mod eis_match;
+pub mod face_attendance;
 pub mod geo_location;
 pub mod logs;
 pub mod nfc_card;
