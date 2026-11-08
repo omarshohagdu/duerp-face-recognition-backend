@@ -185,6 +185,25 @@ async fn main() -> std::io::Result<()> {
                     // screen without it. The payload is rendering hints only;
                     // ExtAuthMiddleware is what refuses. See docs/access_control.md.
                     .service(routes::access::me_access) // GET|POST /ext-api/me/access?platform=desktop|mobile|kiosk
+                    // Employee office geo-locations + admin approval — see
+                    // src/routes/geo_location.rs and sql/010_employee_geo_location.sql.
+                    // Admin endpoints enforce their permission in the handler;
+                    // employee endpoints act only on the token holder's rows.
+                    .service(routes::geo_location::offices_list)         // POST /ext-api/geo-location/offices?office_id=&status=
+                    .service(routes::geo_location::office_create)        // POST /ext-api/geo-location/offices/create (json)
+                    .service(routes::geo_location::office_update)        // POST /ext-api/geo-location/offices/update (json)
+                    .service(routes::geo_location::office_status)        // POST /ext-api/geo-location/offices/status (json: id, status)
+                    .service(routes::geo_location::requests_list)        // POST /ext-api/geo-location/requests?status=&office_id=&employee_id=&search=&page=&limit=
+                    .service(routes::geo_location::request_approve)      // POST /ext-api/geo-location/requests/approve (json: id, note?)
+                    .service(routes::geo_location::request_reject)       // POST /ext-api/geo-location/requests/reject  (json: id, reason)
+                    .service(routes::geo_location::request_revoke)       // POST /ext-api/geo-location/requests/revoke  (json: id, reason)
+                    .service(routes::geo_location::requests_bulk_review) // POST /ext-api/geo-location/requests/bulk-review (json: action, ids[], note?)
+                    .service(routes::geo_location::request_assign)       // POST /ext-api/geo-location/requests/assign (json: employee_id, geo_location_office_id)
+                    .service(routes::geo_location::request_history)      // POST /ext-api/geo-location/requests/history (json: id)
+                    .service(routes::geo_location::available)            // POST /ext-api/geo-location/available
+                    .service(routes::geo_location::my_locations)         // POST /ext-api/geo-location/my
+                    .service(routes::geo_location::select)               // POST /ext-api/geo-location/select (json: geo_location_office_ids[])
+                    .service(routes::geo_location::remove)               // POST /ext-api/geo-location/remove (json: id)
                     // Role administration — the Access Roles screen. These
                     // ENFORCE their permission unconditionally, unlike the
                     // audit-mode gate: they are new (nobody to break) and they

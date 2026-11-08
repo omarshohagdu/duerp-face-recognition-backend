@@ -495,6 +495,22 @@ fn device_coords(device: Option<&Value>) -> Option<(f64, f64)> {
     Some((lat, long))
 }
 
+// Reported GPS accuracy (metres) from `device_info`, if the device sent one.
+// Same tolerance for spellings as `device_coords`. Absent is NOT a failure:
+// existing clients do not send it, and the accuracy limit only applies to
+// devices that report one (see GEO_MAX_GPS_ACCURACY_METERS in sql/010).
+fn device_accuracy(device: Option<&Value>) -> Option<f64> {
+    let device = device?;
+    ["accuracy_meters", "accuracy", "gps_accuracy", "horizontal_accuracy"]
+        .iter()
+        .find_map(|k| {
+            let v = device.get(*k)?;
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+        })
+        .filter(|a| a.is_finite() && *a >= 0.0)
+}
+
 // Base upload directory, configurable via WOW_UPLOAD_DIR. Defaults to a path
 // relative to the process working directory so it works both locally and in
 // the container (set WOW_UPLOAD_DIR=/app/uploads/wow_attendance to override).
@@ -2685,6 +2701,7 @@ async fn wow_verify_inner(
     // has no row for, so students are recognized and recorded without a
     // location check until student location data exists.
     let mut location_data: Option<Value> = None;
+    let mut device_position: Option<(f64, f64)> = None;
     if id_type == "Employee" {
         let coords = device_coords(device_json.as_ref());
         let (device_lat, device_long) = match coords {
@@ -2704,17 +2721,22 @@ async fn wow_verify_inner(
                 }));
             }
         };
+        let accuracy = device_accuracy(device_json.as_ref());
         log.step(format!(
-            "checking location via attendance.wow_attendance_location_verify \
-             (lat={device_lat}, long={device_long})"
+            "checking location via attendance.employee_geo_location_verify \
+             (lat={device_lat}, long={device_long}, accuracy={accuracy:?})"
         ));
 
+        // Approved-office gate (sql/010). Depending on GEO_LOCATION_MODE it
+        // checks the employee's APPROVED + ACTIVE office points, or falls back
+        // to the old body -> building mapping; `data.source` says which.
         let loc = sqlx::query_scalar::<_, Value>(
-            "SELECT attendance.wow_attendance_location_verify($1, $2, $3)",
+            "SELECT attendance.employee_geo_location_verify($1, $2, $3, $4)",
         )
         .bind(&id)
         .bind(device_lat)
         .bind(device_long)
+        .bind(accuracy)
         .fetch_one(db.get_ref())
         .await;
 
@@ -2734,11 +2756,13 @@ async fn wow_verify_inner(
                 .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("Device location does not match any mapped building");
-            log.step(format!("location NOT verified ({message}) — no attendance recorded"));
+            let code = loc.get("code").and_then(|v| v.as_str()).unwrap_or("OUT_OF_LOCATION");
+            log.step(format!("location NOT verified ({code}: {message}) — no attendance recorded"));
             return HttpResponse::Forbidden().json(json!({
                 "success": false,
                 "matched": true,
                 "verified": false,
+                "code": code,
                 "message": message,
                 "recognized_identifier": id,
                 "location": loc.get("data").cloned().unwrap_or(Value::Null),
@@ -2747,6 +2771,7 @@ async fn wow_verify_inner(
         }
         log.step("location verified");
         location_data = loc.get("data").cloned();
+        device_position = Some((device_lat, device_long));
     } else {
         log.step(format!("location check skipped — id_type={id_type} is not an Employee"));
     }
@@ -2771,6 +2796,30 @@ async fn wow_verify_inner(
 
     match result {
         Ok(mut json) => {
+            // Stamp where the check-in matched onto the record (sql/010).
+            // Best effort: the attendance IS recorded, and failing the request
+            // now would invite a retry that records it twice.
+            let record_id = json
+                .pointer("/data/attendance_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok());
+            if let (Some(record_id), Some((lat, long)), Some(loc)) =
+                (record_id, device_position, location_data.as_ref())
+            {
+                if let Err(e) = sqlx::query(
+                    "SELECT attendance.wow_attendance_record_location($1, $2, $3, $4)",
+                )
+                .bind(record_id)
+                .bind(lat)
+                .bind(long)
+                .bind(loc)
+                .execute(db.get_ref())
+                .await
+                {
+                    eprintln!("record location stamp failed for {record_id}: {e}");
+                    log.step(format!("record location stamp FAILED (attendance kept): {e}"));
+                }
+            }
             // Report which building the check-in was accepted at, so a caller
             // can show it without a second round-trip.
             if let (Some(obj), Some(loc)) = (json.as_object_mut(), location_data) {
