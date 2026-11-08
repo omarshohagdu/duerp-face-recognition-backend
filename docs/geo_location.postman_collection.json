@@ -1,0 +1,1100 @@
+{
+  "info": {
+    "name": "Employee Office Geo-Location (ext-api)",
+    "description": "Employee office selection with admin approval, and the approved-office location gate on /wow-attendance/verify.\n\nReference: docs/geo_location_api.md · SQL: sql/010_employee_geo_location.sql\n\nEvery request needs X-App-Id / X-App-Password (ExtAuthMiddleware) and `Authorization: Bearer <token>` from this service's POST /login. All endpoints are POST on fixed paths; ids go in the JSON body, list filters in the query string.\n\nSET THE VARIABLES FIRST (collection → Variables): base_url, app_id, app_password, admin_token (a user whose role is admin/superadmin), employee_token (an enrolled employee), employee_id (that employee's emp_id = the token's sub), office_id (a body code).\n\nSuggested run order: 1.1 → 2.1 → 2.2 → 3.1 → 3.2 → 2.3 → 4.1. `geo_location_office_id` and `selection_id` are filled in automatically by 1.1, 2.2 and 3.1.\n\nEnvelope: {\"status\": \"success\"|\"failed\", \"code\"?, \"message\", \"data\"}. Branch on `code`.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "1. Admin · Office geo-locations",
+      "description": "Permission `attendance.geo.manage` (admin / superadmin). Use an admin's token in `admin_token`. Without the permission every call is 403 `FORBIDDEN`.",
+      "item": [
+        {
+          "name": "1.1 Create office point",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP status is 201', () => pm.expect(pm.response.code).to.be.oneOf([201]));",
+                  "let j = {}; try { j = pm.response.json(); } catch (e) {}",
+                  "if (j.code) console.log('[' + pm.info.requestName + '] ' + j.code + ': ' + j.message);",
+                  "if (j.status === 'success' && j.data && j.data.id) { pm.collectionVariables.set('geo_location_office_id', j.data.id); console.log('saved geo_location_office_id=' + j.data.id); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-App-Id",
+                "value": "{{app_id}}"
+              },
+              {
+                "key": "X-App-Password",
+                "value": "{{app_password}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{admin_token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/ext-api/geo-location/offices/create",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ext-api",
+                "geo-location",
+                "offices",
+                "create"
+              ]
+            },
+            "description": "Adds a geo point to an office. `office_id` is the office BODY CODE (ictcell.body.body_code, e.g. 490010). radius_meters 30–1000 (default 100); status ACTIVE|INACTIVE (default ACTIVE); label optional (to tell several points of one office apart).\n\n201 → `data` = the point; its id is saved to `{{geo_location_office_id}}`.\nErrors: 400 INVALID_INPUT · 404 OFFICE_NOT_FOUND.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"office_id\": \"{{office_id}}\",\n  \"latitude\": 23.724032,\n  \"longitude\": 90.400358,\n  \"radius_meters\": 120,\n  \"status\": \"ACTIVE\",\n  \"label\": \"Main building\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "1.2 List office points",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP status is 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));",
+                  "let j = {}; try { j = pm.response.json(); } catch (e) {}",
+                  "if (j.code) console.log('[' + pm.info.requestName + '] ' + j.code + ': ' + j.message);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-App-Id",
+                "value": "{{app_id}}"
+              },
+              {
+                "key": "X-App-Password",
+                "value": "{{app_password}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/ext-api/geo-location/offices",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ext-api",
+                "geo-location",
+                "offices"
+              ],
+              "query": [
+                {
+                  "key": "office_id",
+                  "value": "{{office_id}}",
+                  "disabled": true,
+                  "description": "body code"
+                },
+                {
+                  "key": "status",
+                  "value": "ACTIVE",
+                  "disabled": true,
+                  "description": "ACTIVE | INACTIVE"
+                }
+              ]
+            },
+            "description": "All points with `approved_employees` and `pending_employees` counts. Both filters optional."
+          },
+          "response": []
+        },
+        {
+          "name": "1.3 Update office point",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP status is 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));",
+                  "let j = {}; try { j = pm.response.json(); } catch (e) {}",
+                  "if (j.code) console.log('[' + pm.info.requestName + '] ' + j.code + ': ' + j.message);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-App-Id",
+                "value": "{{app_id}}"
+              },
+              {
+                "key": "X-App-Password",
+                "value": "{{app_password}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{admin_token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/ext-api/geo-location/offices/update",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ext-api",
+                "geo-location",
+                "offices",
+                "update"
+              ]
+            },
+            "description": "Send `id` plus at least one of latitude, longitude, radius_meters, label. Omitted fields are unchanged; `\"label\": \"\"` clears it. Response includes `linked_employees` (PENDING + APPROVED selections affected). Audited.\n\nErrors: 400 INVALID_INPUT · 404 NOT_FOUND.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": {{geo_location_office_id}},\n  \"radius_meters\": 150\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "1.4 Deactivate office point",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP status is 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));",
+                  "let j = {}; try { j = pm.response.json(); } catch (e) {}",
+                  "if (j.code) console.log('[' + pm.info.requestName + '] ' + j.code + ': ' + j.message);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-App-Id",
+                "value": "{{app_id}}"
+              },
+              {
+                "key": "X-App-Password",
+                "value": "{{app_password}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{admin_token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/ext-api/geo-location/offices/status",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ext-api",
+                "geo-location",
+                "offices",
+                "status"
+              ]
+            },
+            "description": "INACTIVE hides the point from selection AND blocks check-ins there for everyone, even APPROVED employees (their selections stay APPROVED). Response includes `approved_employees` (who to notify).",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": {{geo_location_office_id}},\n  \"status\": \"INACTIVE\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "1.5 Activate office point",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP status is 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));",
+                  "let j = {}; try { j = pm.response.json(); } catch (e) {}",
+                  "if (j.code) console.log('[' + pm.info.requestName + '] ' + j.code + ': ' + j.message);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-App-Id",
+                "value": "{{app_id}}"
+              },
+              {
+                "key": "X-App-Password",
+                "value": "{{app_password}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{admin_token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/ext-api/geo-location/offices/status",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ext-api",
+                "geo-location",
+                "offices",
+                "status"
+              ]
+            },
+            "description": "Re-activate. Run this before the employee steps if you ran 1.4.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": {{geo_location_office_id}},\n  \"status\": \"ACTIVE\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "2. Employee · Office selection",
+      "description": "Any logged-in employee (`employee_token`). The employee is ALWAYS the token's `sub` — there is no employee_id parameter. Selecting requires an active Employee face enrollment.",
+      "item": [
+        {
+          "name": "2.1 Available offices",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP status is 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));",
+                  "let j = {}; try { j = pm.response.json(); } catch (e) {}",
+                  "if (j.code) console.log('[' + pm.info.requestName + '] ' + j.code + ': ' + j.message);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-App-Id",
+                "value": "{{app_id}}"
+              },
+              {
+                "key": "X-App-Password",
+                "value": "{{app_password}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{employee_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/ext-api/geo-location/available",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ext-api",
+                "geo-location",
+                "available"
+              ]
+            },
+            "description": "ACTIVE office points the employee can choose from."
+          },
+          "response": []
+        },
+        {
+          "name": "2.2 Select offices",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP status is 201', () => pm.expect(pm.response.code).to.be.oneOf([201]));",
+                  "let j = {}; try { j = pm.response.json(); } catch (e) {}",
+                  "if (j.code) console.log('[' + pm.info.requestName + '] ' + j.code + ': ' + j.message);",
+                  "if (j.status === 'success' && Array.isArray(j.data) && j.data.length) { pm.collectionVariables.set('selection_id', j.data[0].id); console.log('saved selection_id=' + j.data[0].id); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-App-Id",
+                "value": "{{app_id}}"
+              },
+              {
+                "key": "X-App-Password",
+                "value": "{{app_password}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{employee_token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/ext-api/geo-location/select",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ext-api",
+                "geo-location",
+                "select"
+              ]
+            },
+            "description": "Request one or more offices → PENDING. Duplicates collapse; already PENDING/APPROVED ids are skipped; a REJECTED/REMOVED one goes back to PENDING. All-or-nothing validation. The first returned selection id is saved to `{{selection_id}}`.\n\nErrors: 404 EMPLOYEE_NOT_FOUND · 404 NOT_ENROLLED · 404 GEO_LOCATION_OFFICE_NOT_FOUND · 409 ALREADY_SELECTED · 409 OFFICE_REVOKED · 422 LOCATION_LIMIT_EXCEEDED.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"geo_location_office_ids\": [\n    {{geo_location_office_id}}\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "2.3 My offices",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP status is 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));",
+                  "let j = {}; try { j = pm.response.json(); } catch (e) {}",
+                  "if (j.code) console.log('[' + pm.info.requestName + '] ' + j.code + ': ' + j.message);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-App-Id",
+                "value": "{{app_id}}"
+              },
+              {
+                "key": "X-App-Password",
+                "value": "{{app_password}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{employee_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/ext-api/geo-location/my",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ext-api",
+                "geo-location",
+                "my"
+              ]
+            },
+            "description": "Own selections except REMOVED, newest first. `status` = selection status, `office_status` = point status (APPROVED + INACTIVE = approved but currently unusable)."
+          },
+          "response": []
+        },
+        {
+          "name": "2.4 Remove / cancel selection",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP status is 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));",
+                  "let j = {}; try { j = pm.response.json(); } catch (e) {}",
+                  "if (j.code) console.log('[' + pm.info.requestName + '] ' + j.code + ': ' + j.message);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-App-Id",
+                "value": "{{app_id}}"
+              },
+              {
+                "key": "X-App-Password",
+                "value": "{{app_password}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{employee_token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/ext-api/geo-location/remove",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ext-api",
+                "geo-location",
+                "remove"
+              ]
+            },
+            "description": "PENDING or APPROVED → REMOVED. Another person's id answers 404 NOT_FOUND.\n\nErrors: 404 NOT_FOUND · 409 INVALID_STATUS_TRANSITION.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": {{selection_id}}\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "3. Admin · Approvals",
+      "description": "Permission `attendance.geo.review` (admin / superadmin). Use `admin_token`.",
+      "item": [
+        {
+          "name": "3.1 List requests (pending queue)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP status is 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));",
+                  "let j = {}; try { j = pm.response.json(); } catch (e) {}",
+                  "if (j.code) console.log('[' + pm.info.requestName + '] ' + j.code + ': ' + j.message);",
+                  "if (j.status === 'success' && j.data.items && j.data.items.length) { pm.collectionVariables.set('selection_id', j.data.items[0].id); console.log('saved selection_id=' + j.data.items[0].id); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-App-Id",
+                "value": "{{app_id}}"
+              },
+              {
+                "key": "X-App-Password",
+                "value": "{{app_password}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{admin_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/ext-api/geo-location/requests?status=PENDING&page=1&limit=20",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ext-api",
+                "geo-location",
+                "requests"
+              ],
+              "query": [
+                {
+                  "key": "status",
+                  "value": "PENDING"
+                },
+                {
+                  "key": "office_id",
+                  "value": "{{office_id}}",
+                  "disabled": true,
+                  "description": "body code"
+                },
+                {
+                  "key": "employee_id",
+                  "value": "{{employee_id}}",
+                  "disabled": true,
+                  "description": "exact; use with status=ALL for one employee's offices"
+                },
+                {
+                  "key": "search",
+                  "value": "",
+                  "disabled": true,
+                  "description": "emp-id prefix or name"
+                },
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            },
+            "description": "Paginated, oldest request first. status: PENDING (default) | APPROVED | REJECTED | REVOKED | REMOVED | ALL. search = employee-id prefix or name substring. limit ≤ 100. The first item's id is saved to `{{selection_id}}`."
+          },
+          "response": []
+        },
+        {
+          "name": "3.2 Approve",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP status is 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));",
+                  "let j = {}; try { j = pm.response.json(); } catch (e) {}",
+                  "if (j.code) console.log('[' + pm.info.requestName + '] ' + j.code + ': ' + j.message);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-App-Id",
+                "value": "{{app_id}}"
+              },
+              {
+                "key": "X-App-Password",
+                "value": "{{app_password}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{admin_token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/ext-api/geo-location/requests/approve",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ext-api",
+                "geo-location",
+                "requests",
+                "approve"
+              ]
+            },
+            "description": "PENDING → APPROVED. `note` optional. The office point must be ACTIVE.\n\nErrors: 404 NOT_FOUND · 409 INVALID_STATUS_TRANSITION · 409 GEO_LOCATION_OFFICE_INACTIVE.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": {{selection_id}},\n  \"note\": \"Verified posting\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "3.3 Reject",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP status is 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));",
+                  "let j = {}; try { j = pm.response.json(); } catch (e) {}",
+                  "if (j.code) console.log('[' + pm.info.requestName + '] ' + j.code + ': ' + j.message);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-App-Id",
+                "value": "{{app_id}}"
+              },
+              {
+                "key": "X-App-Password",
+                "value": "{{app_password}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{admin_token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/ext-api/geo-location/requests/reject",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ext-api",
+                "geo-location",
+                "requests",
+                "reject"
+              ]
+            },
+            "description": "PENDING → REJECTED. `reason` required (3–255 chars). The employee may select it again later.\n\nErrors: 404 NOT_FOUND · 409 INVALID_STATUS_TRANSITION · 422 REASON_REQUIRED.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": {{selection_id}},\n  \"reason\": \"Not posted at this office\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "3.4 Revoke",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP status is 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));",
+                  "let j = {}; try { j = pm.response.json(); } catch (e) {}",
+                  "if (j.code) console.log('[' + pm.info.requestName + '] ' + j.code + ': ' + j.message);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-App-Id",
+                "value": "{{app_id}}"
+              },
+              {
+                "key": "X-App-Password",
+                "value": "{{app_password}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{admin_token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/ext-api/geo-location/requests/revoke",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ext-api",
+                "geo-location",
+                "requests",
+                "revoke"
+              ]
+            },
+            "description": "APPROVED → REVOKED. `reason` required. The employee cannot re-request a revoked office — only 3.6 Direct assign restores it.\n\nErrors: 404 NOT_FOUND · 409 INVALID_STATUS_TRANSITION · 422 REASON_REQUIRED.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": {{selection_id}},\n  \"reason\": \"Transferred to another office\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "3.5 Bulk review",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP status is 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));",
+                  "let j = {}; try { j = pm.response.json(); } catch (e) {}",
+                  "if (j.code) console.log('[' + pm.info.requestName + '] ' + j.code + ': ' + j.message);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-App-Id",
+                "value": "{{app_id}}"
+              },
+              {
+                "key": "X-App-Password",
+                "value": "{{app_password}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{admin_token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/ext-api/geo-location/requests/bulk-review",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ext-api",
+                "geo-location",
+                "requests",
+                "bulk-review"
+              ]
+            },
+            "description": "action APPROVE | REJECT | REVOKE, 1–200 ids. Each id is reviewed independently → `data.succeeded[]` and `data.failed[]` ({id, code, message}). `note`/`reason` required for REJECT and REVOKE (otherwise 422 REASON_REQUIRED for the whole call).",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"action\": \"APPROVE\",\n  \"ids\": [\n    {{selection_id}}\n  ],\n  \"note\": \"Branch staff\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "3.6 Direct assign (APPROVED)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP status is 201', () => pm.expect(pm.response.code).to.be.oneOf([201]));",
+                  "let j = {}; try { j = pm.response.json(); } catch (e) {}",
+                  "if (j.code) console.log('[' + pm.info.requestName + '] ' + j.code + ': ' + j.message);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-App-Id",
+                "value": "{{app_id}}"
+              },
+              {
+                "key": "X-App-Password",
+                "value": "{{app_password}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{admin_token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/ext-api/geo-location/requests/assign",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ext-api",
+                "geo-location",
+                "requests",
+                "assign"
+              ]
+            },
+            "description": "Admin assigns an office directly, created APPROVED (also restores REVOKED / REJECTED / REMOVED). Employee must exist; enrollment not required; the per-employee limit is not applied.\n\nErrors: 404 EMPLOYEE_NOT_FOUND · 404 GEO_LOCATION_OFFICE_NOT_FOUND · 409 ALREADY_SELECTED.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"employee_id\": \"{{employee_id}}\",\n  \"geo_location_office_id\": {{geo_location_office_id}},\n  \"note\": \"Posted by HR order\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "3.7 Selection history",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP status is 200', () => pm.expect(pm.response.code).to.be.oneOf([200]));",
+                  "let j = {}; try { j = pm.response.json(); } catch (e) {}",
+                  "if (j.code) console.log('[' + pm.info.requestName + '] ' + j.code + ': ' + j.message);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-App-Id",
+                "value": "{{app_id}}"
+              },
+              {
+                "key": "X-App-Password",
+                "value": "{{app_password}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{admin_token}}"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/ext-api/geo-location/requests/history",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ext-api",
+                "geo-location",
+                "requests",
+                "history"
+              ]
+            },
+            "description": "The selection plus its audit trail (REQUEST / APPROVE / REJECT / REVOKE / REMOVE / ASSIGN, with actor and note).",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": {{selection_id}}\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "4. Attendance (existing endpoint)",
+      "description": "Face + location check-in. Unchanged request; the location gate is new.",
+      "item": [
+        {
+          "name": "4.1 Verify / mark attendance (location gate)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "let j = {}; try { j = pm.response.json(); } catch (e) {}",
+                  "pm.test('Attendance marked (200) or location refused (403)', () => pm.expect(pm.response.code).to.be.oneOf([200, 403]));",
+                  "if (j.location) console.log('location.source=' + j.location.source + ' code=' + (j.code || 'OK') + ' distance=' + (j.location.distance_meters ?? j.location.distance_m));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-App-Id",
+                "value": "{{app_id}}"
+              },
+              {
+                "key": "X-App-Password",
+                "value": "{{app_password}}"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{employee_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/ext-api/wow-attendance/verify",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ext-api",
+                "wow-attendance",
+                "verify"
+              ]
+            },
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "device_info",
+                  "type": "text",
+                  "value": "{\"device_lat\": 23.72410, \"device_long\": 90.40041, \"accuracy_meters\": 12.5, \"device\": \"Android\", \"app_version\": \"2.1.0\"}",
+                  "description": "GPS is required for employees. accuracy_meters is optional; if sent and > GEO_MAX_GPS_ACCURACY_METERS (50) → GPS_ACCURACY_TOO_LOW."
+                },
+                {
+                  "key": "image",
+                  "type": "file",
+                  "src": [],
+                  "description": "Live selfie of the token holder"
+                }
+              ]
+            },
+            "description": "Existing endpoint; the location check now uses the employee's APPROVED + ACTIVE office points (nearest point within its radius), depending on GEO_LOCATION_MODE. `location.source` says which rule decided: APPROVED_OFFICE or BODY_MAPPING.\n\n200 → attendance recorded, `location` = matched office + distance.\n403 → `code`: OUT_OF_LOCATION (nearest office in `location`) · NO_APPROVED_LOCATION · GPS_ACCURACY_TOO_LOW · INVALID_COORDINATES · LOCATION_NOT_VERIFIED.\n\nChoose a selfie file for `image` before sending."
+          },
+          "response": []
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8083",
+      "type": "string"
+    },
+    {
+      "key": "app_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "app_password",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "admin_token",
+      "value": "",
+      "type": "string",
+      "description": "Bearer token of an admin/superadmin user (POST /login)"
+    },
+    {
+      "key": "employee_token",
+      "value": "",
+      "type": "string",
+      "description": "Bearer token of an enrolled employee (POST /login)"
+    },
+    {
+      "key": "employee_id",
+      "value": "1957103001",
+      "type": "string",
+      "description": "emp_id of the employee (= employee_token's sub)"
+    },
+    {
+      "key": "office_id",
+      "value": "490010",
+      "type": "string",
+      "description": "Office body code (ictcell.body.body_code)"
+    },
+    {
+      "key": "geo_location_office_id",
+      "value": "",
+      "type": "string",
+      "description": "Set by 1.1 Create office point"
+    },
+    {
+      "key": "selection_id",
+      "value": "",
+      "type": "string",
+      "description": "Set by 2.2 Select offices / 3.1 List requests"
+    }
+  ]
+}
