@@ -7,6 +7,7 @@ Everything the employee mobile app needs: sign in, enroll a selfie, choose an of
 | Base URL | production `https://attendence.du.ac.bd` · dev `http://<host>:8083` |
 | Format | JSON, except enroll and mark, which are `multipart/form-data` |
 | Detailed references | [`face_attendance_api.md`](face_attendance_api.md) · [`geo_location_api.md`](geo_location_api.md) |
+| Acting for a colleague with no phone | [`others_attendance_api.md`](others_attendance_api.md): Others Selfie Attendance and Office Location (Others) |
 
 ---
 
@@ -22,7 +23,7 @@ Sign in ─► Enroll selfie ─► Choose office ─► (admin approves) ─►
 | 1 | `POST /login` | Login |
 | 2 | `POST /ext-api/face-attendance/enroll` | Enroll selfie |
 | 3 | `POST /ext-api/geo-location/available` → `POST /ext-api/geo-location/select` | Choose office |
-| 4 | `POST /ext-api/geo-location/my` | My offices: wait for **APPROVED** |
+| 4 | `POST /ext-api/geo-location/my` | Office Location (Self): wait for **APPROVED** |
 | 5 | `POST /ext-api/face-attendance/mark` | Mark attendance |
 
 An administrator approves the office in the web admin panel. The app only waits, and shows the status from step 4.
@@ -32,7 +33,7 @@ Suggested start-up logic after login:
 ```
 my = POST /ext-api/geo-location/my
 if the user has never enrolled → Enroll selfie screen        (you'll learn this from mark: NOT_ENROLLED)
-else if no office in `my` has status APPROVED → My offices screen
+else if no office in `my` has status APPROVED → Office Location (Self) screen
 else → Mark attendance screen
 ```
 
@@ -195,7 +196,7 @@ POST /ext-api/geo-location/select
 | `GEO_LOCATION_OFFICE_NOT_FOUND` | 404 | "This office is no longer available"; refresh the list |
 | `EMPLOYEE_NOT_FOUND` | 404 | "Only staff can choose an office" |
 
-### 6.3 My offices
+### 6.3 My offices (menu: Office Location (Self))
 
 ```
 POST /ext-api/geo-location/my

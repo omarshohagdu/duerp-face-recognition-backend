@@ -166,6 +166,12 @@ async fn main() -> std::io::Result<()> {
                     // and an approved-office GPS check. src/routes/face_attendance.rs.
                     .service(routes::face_attendance::face_enroll) // POST /ext-api/face-attendance/enroll (multipart: employee_id, employee_selfie_image, device_info?)
                     .service(routes::face_attendance::face_mark)   // POST /ext-api/face-attendance/mark   (multipart: employee_id, selfie_image, device_info with GPS)
+                    // Others Selfie Attendance: a colleague (`enrolled_by` = the
+                    // token holder) enrolls / marks an employee who has no phone.
+                    // sql/012_face_attendance_others.sql.
+                    .service(routes::face_attendance::face_others_enroll) // POST /ext-api/face-attendance/others/enroll (multipart: employee_id, employee_selfie_image, enrolled_by, device_info?)
+                    .service(routes::face_attendance::face_others_mark)   // POST /ext-api/face-attendance/others/mark   (multipart: employee_id, selfie_image, enrolled_by, device_info with GPS)
+                    .service(routes::face_attendance::face_others_list)   // POST /ext-api/face-attendance/others/list   (enrolled_by? query or json)
                     // Readers for the two step-log folders. They sit here
                     // rather than on their own scope so they inherit the
                     // app-credential + IP allow-list gate every other ext-api
@@ -209,6 +215,11 @@ async fn main() -> std::io::Result<()> {
                     .service(routes::geo_location::my_locations)         // POST /ext-api/geo-location/my
                     .service(routes::geo_location::select)               // POST /ext-api/geo-location/select (json: geo_location_office_ids[])
                     .service(routes::geo_location::remove)               // POST /ext-api/geo-location/remove (json: id)
+                    // Office Location (Others): for an employee the caller enrolled
+                    // (sql/013_geo_location_others.sql). The office list is /available.
+                    .service(routes::geo_location::others_my)     // POST /ext-api/geo-location/others/my     (json: employee_id, enrolled_by)
+                    .service(routes::geo_location::others_select) // POST /ext-api/geo-location/others/select (json: employee_id, enrolled_by, geo_location_office_ids[])
+                    .service(routes::geo_location::others_remove) // POST /ext-api/geo-location/others/remove (json: employee_id, enrolled_by, id)
                     // Role administration — the Access Roles screen. These
                     // ENFORCE their permission unconditionally, unlike the
                     // audit-mode gate: they are new (nobody to break) and they

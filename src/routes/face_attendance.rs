@@ -3,6 +3,12 @@
 //!   POST /ext-api/face-attendance/enroll   multipart: employee_id, employee_selfie_image, device_info?
 //!   POST /ext-api/face-attendance/mark     multipart: employee_id, selfie_image, device_info (GPS)
 //!
+//! Others Selfie Attendance (a colleague acting for an employee with no phone):
+//!
+//!   POST /ext-api/face-attendance/others/enroll  multipart: employee_id, employee_selfie_image, enrolled_by, device_info?
+//!   POST /ext-api/face-attendance/others/mark    multipart: employee_id, selfie_image, enrolled_by, device_info (GPS)
+//!   POST /ext-api/face-attendance/others/list    enrolled_by? (query or JSON)
+//!
 //! A second path next to `/wow-attendance/enroll` + `/verify`. Instead of the AI
 //! platform learning a face and identifying people 1:N, this one stores ONE
 //! selfie per employee and, at check-in, asks the face-verify service at
@@ -85,6 +91,8 @@ fn logger(route: &'static str, req: &actix_web::HttpRequest) -> StepLogger {
 
 struct Upload {
     employee_id: Option<String>,
+    /// Others path only: the colleague acting for `employee_id`.
+    enrolled_by: Option<String>,
     device_info: Option<String>,
     image: Option<String>,
 }
@@ -102,7 +110,7 @@ async fn read_upload(
         }
     }
 
-    let mut up = Upload { employee_id: query_employee_id, device_info: None, image: None };
+    let mut up = Upload { employee_id: query_employee_id, enrolled_by: None, device_info: None, image: None };
 
     while let Some(item) = payload.next().await {
         let mut field = item.map_err(|e| {
@@ -197,6 +205,11 @@ async fn read_upload(
             "employee_id" | "id" => {
                 if !text.is_empty() {
                     up.employee_id = Some(text);
+                }
+            }
+            "enrolled_by" | "marked_by" => {
+                if !text.is_empty() {
+                    up.enrolled_by = Some(text);
                 }
             }
             "device_info" => {
@@ -337,11 +350,14 @@ struct Caller {
     employee_id: String,
 }
 
+/// `field` names the part that must hold the token holder's own id:
+/// `employee_id` on the self path, `enrolled_by` on the others path.
 async fn identify_caller(
     log: &StepLogger,
     req: &actix_web::HttpRequest,
     db: &web::Data<PgPool>,
     employee_id: Option<String>,
+    field: &str,
     action: &str,
 ) -> Result<Caller, HttpResponse> {
     let token = require_bearer_token(req)?;
@@ -349,35 +365,92 @@ async fn identify_caller(
     log.step(line);
 
     let Some(employee_id) = employee_id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
-        return Err(fail(StatusCode::BAD_REQUEST, "INVALID_INPUT", "`employee_id` is required"));
+        return Err(fail(StatusCode::BAD_REQUEST, "INVALID_INPUT", format!("`{field}` is required")));
     };
     log.set_id(&employee_id);
 
-    // Self only: the employee id must be the token holder's.
+    // Self only: the id must be the token holder's.
     let who = du_identify(&employee_id, token_user_id, log).await;
     if !who.owned {
-        let message = format!("Person mismatch. employee_id={employee_id} but Logged in User id={token_user_id}");
+        let message = format!("Person mismatch. {field}={employee_id} but Logged in User id={token_user_id}");
         log.step(&message);
         record_token_mismatch(db.get_ref(), action, &employee_id, token_user_id, None, None, log).await;
         return Err(reply(
             StatusCode::UNAUTHORIZED,
             "NOT_YOUR_ID",
-            "You can only enroll or mark attendance for yourself.",
-            json!({ "employee_id": employee_id, "logged_in_user_id": token_user_id }),
+            if field == "employee_id" {
+                "You can only enroll or mark attendance for yourself.".to_string()
+            } else {
+                format!("`{field}` must be your own employee ID.")
+            },
+            json!({ field: employee_id, "logged_in_user_id": token_user_id }),
         ));
     }
 
-    let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM attendance.employees WHERE emp_id = $1)")
-        .bind(&employee_id)
-        .fetch_one(db.get_ref())
-        .await
-        .unwrap_or(false);
-    if !exists {
-        log.step("employee not found in attendance.employees");
+    if !employee_exists(db.get_ref(), &employee_id).await {
+        log.step(format!("{field} {employee_id} not found in attendance.employees"));
         return Err(fail(StatusCode::NOT_FOUND, "EMPLOYEE_NOT_FOUND", "No staff record was found for this employee ID."));
     }
 
     Ok(Caller { token, employee_id })
+}
+
+async fn employee_exists(db: &PgPool, employee_id: &str) -> bool {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM attendance.employees WHERE emp_id = $1)")
+        .bind(employee_id)
+        .fetch_one(db)
+        .await
+        .unwrap_or(false)
+}
+
+/// Others path: the employee being enrolled / marked. Must be given, must not
+/// be the caller (that is the self path), and must be staff.
+async fn resolve_subject(
+    log: &StepLogger,
+    db: &PgPool,
+    employee_id: Option<String>,
+    caller: &Caller,
+    self_code: &str,
+) -> Result<String, HttpResponse> {
+    let Some(subject) = employee_id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+        return Err(fail(StatusCode::BAD_REQUEST, "INVALID_INPUT", "`employee_id` is required"));
+    };
+    if subject == caller.employee_id {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            self_code,
+            "That is your own employee ID. Use Selfie attendance for yourself.",
+        ));
+    }
+    if !employee_exists(db, &subject).await {
+        log.step(format!("employee {subject} not found in attendance.employees"));
+        return Err(fail(StatusCode::NOT_FOUND, "EMPLOYEE_NOT_FOUND", "No staff record was found for this employee ID."));
+    }
+    log.step(format!("acting for employee {subject} (by {})", caller.employee_id));
+    log.set_id(&subject);
+    Ok(subject)
+}
+
+/// Enroll's image check: the selfie against itself. The service refuses a
+/// photo with no clear face (4xx), which is exactly what must not be enrolled.
+async fn check_enroll_image(log: &StepLogger, db: &PgPool, image: &str) -> Result<Verdict, HttpResponse> {
+    log.step("checking the selfie with the face-verify service (selfie vs itself)");
+    let check = compare_faces(log, db, image, image).await.map_err(verify_error_response)?;
+    if !check.matched {
+        return Err(reply(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "LOW_IMAGE_QUALITY",
+            "This photo isn't clear enough to use. Retake it facing the camera in good light.",
+            json!({ "similarity": check.similarity, "detail": check.detail }),
+        ));
+    }
+    Ok(check)
+}
+
+fn device_object(raw: Option<&str>) -> Value {
+    raw.and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}))
 }
 
 // ---------------------------------------------------------------------
@@ -417,7 +490,7 @@ async fn face_enroll_inner(
         Ok(u) => u,
         Err(resp) => return resp,
     };
-    let caller = match identify_caller(log, req, db, up.employee_id.clone(), "FaceVerifyEnroll").await {
+    let caller = match identify_caller(log, req, db, up.employee_id.clone(), "employee_id", "FaceVerifyEnroll").await {
         Ok(c) => c,
         Err(resp) => return resp,
     };
@@ -427,28 +500,12 @@ async fn face_enroll_inner(
 
     let image = reduce_saved_image(&image).await;
 
-    // Image check: the selfie against itself. The service refuses a photo
-    // with no clear face (4xx), which is exactly what must not be enrolled.
-    log.step("checking the selfie with the face-verify service (selfie vs itself)");
-    let check = match compare_faces(log, db.get_ref(), &image, &image).await {
+    let check = match check_enroll_image(log, db.get_ref(), &image).await {
         Ok(v) => v,
-        Err(e) => return verify_error_response(e),
+        Err(resp) => return resp,
     };
-    if !check.matched {
-        return reply(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "LOW_IMAGE_QUALITY",
-            "This photo isn't clear enough to use. Retake it facing the camera in good light.",
-            json!({ "similarity": check.similarity, "detail": check.detail }),
-        );
-    }
 
-    let mut device = up
-        .device_info
-        .as_deref()
-        .and_then(|s| serde_json::from_str::<Value>(s).ok())
-        .filter(Value::is_object)
-        .unwrap_or_else(|| json!({}));
+    let mut device = device_object(up.device_info.as_deref());
     device["enroll_method"] = json!("FACE_VERIFY");
 
     log.step("persisting enrollment via attendance.wow_attendance_enroll");
@@ -576,7 +633,7 @@ async fn face_mark_inner(
         Ok(u) => u,
         Err(resp) => return resp,
     };
-    let caller = match identify_caller(log, req, db, up.employee_id.clone(), "FaceVerifyMark").await {
+    let caller = match identify_caller(log, req, db, up.employee_id.clone(), "employee_id", "FaceVerifyMark").await {
         Ok(c) => c,
         Err(resp) => return resp,
     };
@@ -584,7 +641,23 @@ async fn face_mark_inner(
         return fail(StatusCode::BAD_REQUEST, "INVALID_INPUT", "`selfie_image` is required (one image)");
     };
 
-    let device_json: Option<Value> = up.device_info.as_deref().and_then(|s| serde_json::from_str(s).ok());
+    mark_core(log, db, &caller, &caller.employee_id, None, selfie, up.device_info.as_deref()).await
+}
+
+/// The back half of a check-in, shared by the self path (`marker` None) and the
+/// others path (`marker` = the colleague holding the phone): GPS, enrolled
+/// reference, face match, approved-office location, record.
+async fn mark_core(
+    log: &StepLogger,
+    db: &web::Data<PgPool>,
+    caller: &Caller,
+    subject: &str,
+    marker: Option<&str>,
+    selfie: String,
+    device_info: Option<&str>,
+) -> HttpResponse {
+    let others = marker.is_some();
+    let mut device_json: Option<Value> = device_info.and_then(|s| serde_json::from_str(s).ok());
     let Some((lat, long)) = device_coords(device_json.as_ref()) else {
         return fail(
             StatusCode::BAD_REQUEST,
@@ -595,16 +668,22 @@ async fn face_mark_inner(
     let accuracy = device_accuracy(device_json.as_ref());
 
     // Reference image.
-    let reference = match enrolled_reference(db.get_ref(), &caller.employee_id).await {
+    let reference = match enrolled_reference(db.get_ref(), subject).await {
         Ok(None) => {
-            return fail(StatusCode::NOT_FOUND, "NOT_ENROLLED", "You haven't enrolled your selfie yet. Enroll first.")
+            return fail(
+                StatusCode::NOT_FOUND,
+                "NOT_ENROLLED",
+                if others { "This employee isn't enrolled yet. Enroll their selfie first." }
+                else { "You haven't enrolled your selfie yet. Enroll first." },
+            )
         }
         Ok(Some(None)) => {
             log.step("active enrollment has no image on disk");
             return fail(
                 StatusCode::CONFLICT,
                 "ENROLLED_IMAGE_MISSING",
-                "Your enrolled photo is no longer available. Enroll your selfie again.",
+                if others { "This employee's enrolled photo is no longer available. Enroll them again." }
+                else { "Your enrolled photo is no longer available. Enroll your selfie again." },
             );
         }
         Ok(Some(Some(p))) => p,
@@ -628,20 +707,34 @@ async fn face_mark_inner(
         "threshold":  verdict.threshold,
     });
     if !verdict.matched {
-        log_face_failure(db.get_ref(), &caller.employee_id, "FACE_NOT_MATCHED", lat, long, accuracy).await;
+        log_face_failure(db.get_ref(), subject, "FACE_NOT_MATCHED", lat, long, accuracy).await;
         return reply(
             StatusCode::FORBIDDEN,
             "FACE_NOT_MATCHED",
-            "Your selfie doesn't match your enrolled photo. Try again facing the camera in good light.",
+            if others { "The selfie doesn't match this employee's enrolled photo. Try again facing the camera in good light." }
+            else { "Your selfie doesn't match your enrolled photo. Try again facing the camera in good light." },
             json!({ "face_match": face, "detail": verdict.detail }),
         );
     }
 
     // 2 · Location: approved offices only on this path.
+    let geo_owner = match marker {
+        None => subject.to_string(),
+        Some(m) => match location_owner(db.get_ref(), subject, m).await {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("DB error in face_mark (location owner): {e}");
+                return fail(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "Internal server error");
+            }
+        },
+    };
+    if marker.is_some() {
+        log.step(format!("location checked against {geo_owner}'s approved offices"));
+    }
     let loc = sqlx::query_scalar::<_, Value>(
         "SELECT attendance.employee_geo_location_verify($1, $2, $3, $4, 'APPROVED_OFFICE')",
     )
-    .bind(&caller.employee_id)
+    .bind(&geo_owner)
     .bind(lat)
     .bind(long)
     .bind(accuracy)
@@ -655,7 +748,10 @@ async fn face_mark_inner(
             return fail(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "Internal server error");
         }
     };
-    let location = loc.get("data").cloned().unwrap_or(Value::Null);
+    let mut location = loc.get("data").cloned().unwrap_or(Value::Null);
+    if marker.is_some() && location.is_object() {
+        location["checked_against"] = json!(if geo_owner == subject { "EMPLOYEE" } else { "ENROLLER" });
+    }
     if loc.get("verified").and_then(Value::as_bool) != Some(true) {
         let code = loc.get("code").and_then(Value::as_str).unwrap_or("OUT_OF_LOCATION").to_string();
         let message = loc.get("message").and_then(Value::as_str).unwrap_or("Location not verified").to_string();
@@ -664,11 +760,14 @@ async fn face_mark_inner(
     }
 
     // 3 · Record.
+    if let (Some(m), Some(Value::Object(d))) = (marker, device_json.as_mut()) {
+        d.insert("marked_by".into(), json!(m));
+    }
     let confidence = verdict.similarity.unwrap_or(1.0).clamp(0.0, 1.0);
     let rec = sqlx::query_scalar::<_, Value>(
         "SELECT attendance.wow_attendance_verify($1, 'Employee', $2, $3, $4, true, $5)",
     )
-    .bind(&caller.employee_id)
+    .bind(subject)
     .bind(&caller.token)
     .bind(device_json.clone())
     .bind(&selfie)
@@ -707,7 +806,17 @@ async fn face_mark_inner(
         .bind(verdict.similarity)
         .execute(db.get_ref())
         .await;
-        if let Err(e) = stamped.and(method) {
+        // Separate so the self path never depends on sql/012's column.
+        let by = match marker {
+            Some(m) => sqlx::query("UPDATE attendance.wow_attendance_records SET marked_by = $2 WHERE id = $1")
+                .bind(id)
+                .bind(m)
+                .execute(db.get_ref())
+                .await
+                .map(|_| ()),
+            None => Ok(()),
+        };
+        if let Err(e) = stamped.map(|_| ()).and(method.map(|_| ())).and(by) {
             // The attendance IS recorded; failing now would invite a duplicate retry.
             eprintln!("record stamp failed for {id}: {e}");
             log.step(format!("record stamp FAILED (attendance kept): {e}"));
@@ -720,12 +829,339 @@ async fn face_mark_inner(
         "OK",
         "Attendance marked",
         json!({
-            "employee_id":   caller.employee_id,
+            "employee_id":   subject,
+            "marked_by":     marker,
             "attendance_id": data.get("attendance_id"),
             "marked_at":     data.get("matched_at"),
             "face_match":    face,
             "geo_match":     location,
         }),
+    )
+}
+
+// ---------------------------------------------------------------------
+// Others Selfie Attendance — one employee acting for another who has no phone.
+//
+//   POST /ext-api/face-attendance/others/enroll  multipart: employee_id, employee_selfie_image, enrolled_by, device_info?
+//   POST /ext-api/face-attendance/others/mark    multipart: employee_id, selfie_image, enrolled_by, device_info (GPS)
+//   POST /ext-api/face-attendance/others/list    query/json: enrolled_by?
+//
+// `enrolled_by` is ALWAYS the token holder (checked exactly like `employee_id`
+// on the self path); `employee_id` is the colleague being enrolled / marked.
+// The face is still checked 1:1 against the employee's enrolled selfie, so the
+// employee has to be in front of the camera. sql/012_face_attendance_others.sql.
+// ---------------------------------------------------------------------
+
+/// Whose approved offices an others check-in is measured against: the
+/// employee's own when they have any approved office (an admin can assign one
+/// with /geo-location/requests/assign), otherwise the enroller's — the person
+/// without a phone usually could not select an office, and the enroller is
+/// standing next to them.
+async fn location_owner(db: &PgPool, subject: &str, marker: &str) -> Result<String, sqlx::Error> {
+    let has: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM attendance.employee_geo_location
+                         WHERE employee_id = $1 AND status = 'APPROVED')",
+    )
+    .bind(subject)
+    .fetch_one(db)
+    .await?;
+    Ok(if has { subject.to_string() } else { marker.to_string() })
+}
+
+#[derive(serde::Deserialize)]
+pub struct OthersQuery {
+    pub employee_id: Option<String>,
+    pub enrolled_by: Option<String>,
+}
+
+#[post("/face-attendance/others/enroll")]
+pub async fn face_others_enroll(
+    req: actix_web::HttpRequest,
+    db: web::Data<PgPool>,
+    query: web::Query<OthersQuery>,
+    payload: Multipart,
+) -> HttpResponse {
+    let log = logger("ext-api/face-attendance/others/enroll", &req);
+    let resp = face_others_enroll_inner(&log, &req, &db, query.into_inner(), payload).await;
+    log_local_response(&log, resp).await
+}
+
+async fn face_others_enroll_inner(
+    log: &StepLogger,
+    req: &actix_web::HttpRequest,
+    db: &web::Data<PgPool>,
+    query: OthersQuery,
+    payload: Multipart,
+) -> HttpResponse {
+    log.step("request received (others)");
+    if let Err(resp) = require_token_caller(req) {
+        return resp;
+    }
+    let up = match read_upload(log, payload, &enrolled_dir(), query.employee_id).await {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+    let enroller = up.enrolled_by.clone().or(query.enrolled_by);
+    let caller = match identify_caller(log, req, db, enroller, "enrolled_by", "FaceVerifyEnrollOthers").await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let subject = match resolve_subject(log, db.get_ref(), up.employee_id.clone(), &caller, "USE_SELF_ENROLL").await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    // Cheap refusal before spending two face-verify calls; the SQL function
+    // repeats it under a row lock, so this is not the guard, only a shortcut.
+    let current: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT enrolled_by FROM attendance.wow_attendance_enrollments
+          WHERE person_id = $1 AND id_type = 'Employee' AND is_active
+          ORDER BY enrolled_at DESC, version DESC LIMIT 1",
+    )
+    .bind(&subject)
+    .fetch_optional(db.get_ref())
+    .await
+    .unwrap_or(None);
+    match current {
+        Some(None) => {
+            return reply(
+                StatusCode::CONFLICT,
+                "ALREADY_SELF_ENROLLED",
+                "This employee enrolled their own selfie. Only they can replace it.",
+                json!({ "employee_id": subject }),
+            )
+        }
+        Some(Some(by)) if by != caller.employee_id => {
+            return reply(
+                StatusCode::CONFLICT,
+                "ENROLLED_BY_OTHER",
+                "Another colleague enrolled this employee. Only they, or the employee, can replace it.",
+                json!({ "employee_id": subject, "enrolled_by": by }),
+            )
+        }
+        _ => {}
+    }
+
+    let Some(image) = up.image else {
+        return fail(StatusCode::BAD_REQUEST, "INVALID_INPUT", "`employee_selfie_image` is required (one image)");
+    };
+    let image = reduce_saved_image(&image).await;
+
+    let check = match check_enroll_image(log, db.get_ref(), &image).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    // The enroller must not register their OWN face under a colleague's ID —
+    // that would let them check that colleague in from anywhere. Compared
+    // against the enroller's enrolled selfie when they have one.
+    match enrolled_reference(db.get_ref(), &caller.employee_id).await {
+        Ok(Some(Some(own))) => {
+            log.step("comparing with the enroller's own enrolled selfie");
+            match compare_faces(log, db.get_ref(), &own, &image).await {
+                Ok(v) if v.matched => {
+                    log.step("REFUSED: selfie matches the enroller");
+                    record_token_mismatch(
+                        db.get_ref(),
+                        "FaceVerifyEnrollOthersSelf",
+                        &subject,
+                        caller.employee_id.parse().unwrap_or(0),
+                        None,
+                        v.similarity,
+                        log,
+                    )
+                    .await;
+                    return reply(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "SAME_AS_ENROLLER",
+                        "This photo looks like you. Take the photo of the employee you are enrolling.",
+                        json!({ "similarity": v.similarity }),
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => return verify_error_response(e),
+            }
+        }
+        Ok(_) => log.step("enroller has no enrolled selfie — same-face check skipped"),
+        Err(e) => {
+            eprintln!("DB error in face_others_enroll (enroller reference): {e}");
+            return fail(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "Internal server error");
+        }
+    }
+
+    let mut device = device_object(up.device_info.as_deref());
+    device["enroll_method"] = json!("FACE_VERIFY");
+
+    log.step("persisting enrollment via attendance.face_enroll_for_other");
+    let result = sqlx::query_scalar::<_, Value>("SELECT attendance.face_enroll_for_other($1, $2, $3, $4, $5)")
+        .bind(&subject)
+        .bind(&caller.employee_id)
+        .bind(&caller.token)
+        .bind(&device)
+        .bind(vec![image.clone()])
+        .fetch_one(db.get_ref())
+        .await;
+
+    match result {
+        Ok(body) if body.get("success").and_then(Value::as_bool) == Some(true) => {
+            let d = body.get("data").cloned().unwrap_or(Value::Null);
+            let reenroll = d.get("is_reenrollment").and_then(Value::as_bool).unwrap_or(false);
+            reply(
+                StatusCode::CREATED,
+                "OK",
+                if reenroll { "Selfie updated for this employee." } else { "Employee enrolled. You can now mark their attendance." },
+                json!({
+                    "employee_id":            subject,
+                    "enrolled_by":            caller.employee_id,
+                    "enrollment_id":          d.get("enrollment_id"),
+                    "version":                d.get("version"),
+                    "is_reenrollment":        reenroll,
+                    "previous_enrollment_id": d.get("previous_enrollment_id"),
+                    "image_check":            { "passed": true, "similarity": check.similarity },
+                    "next_step":              "MARK_ATTENDANCE",
+                }),
+            )
+        }
+        Ok(body) => {
+            log.step(format!("enroll function refused: {body}"));
+            let code = body.get("code").and_then(Value::as_str).unwrap_or("ENROLL_FAILED").to_string();
+            let status = match code.as_str() {
+                "ALREADY_SELF_ENROLLED" | "ENROLLED_BY_OTHER" => StatusCode::CONFLICT,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            reply(
+                status,
+                &code,
+                body.get("message").and_then(Value::as_str).unwrap_or("Enrollment failed").to_string(),
+                body.get("data").cloned().unwrap_or_else(|| json!({})),
+            )
+        }
+        Err(e) => {
+            eprintln!("DB error in face_others_enroll: {e}");
+            log.step(format!("DB enroll FAILED: {e}"));
+            fail(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "Internal server error")
+        }
+    }
+}
+
+#[post("/face-attendance/others/mark")]
+pub async fn face_others_mark(
+    req: actix_web::HttpRequest,
+    db: web::Data<PgPool>,
+    query: web::Query<OthersQuery>,
+    payload: Multipart,
+) -> HttpResponse {
+    let log = logger("ext-api/face-attendance/others/mark", &req);
+    let resp = face_others_mark_inner(&log, &req, &db, query.into_inner(), payload).await;
+    log_local_response(&log, resp).await
+}
+
+async fn face_others_mark_inner(
+    log: &StepLogger,
+    req: &actix_web::HttpRequest,
+    db: &web::Data<PgPool>,
+    query: OthersQuery,
+    payload: Multipart,
+) -> HttpResponse {
+    log.step("request received (others)");
+    if let Err(resp) = require_token_caller(req) {
+        return resp;
+    }
+    let up = match read_upload(log, payload, &live_dir(), query.employee_id).await {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+    let marker = up.enrolled_by.clone().or(query.enrolled_by);
+    let caller = match identify_caller(log, req, db, marker, "enrolled_by", "FaceVerifyMarkOthers").await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let subject = match resolve_subject(log, db.get_ref(), up.employee_id.clone(), &caller, "USE_SELF_MARK").await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let Some(selfie) = up.image else {
+        return fail(StatusCode::BAD_REQUEST, "INVALID_INPUT", "`selfie_image` is required (one image)");
+    };
+
+    mark_core(log, db, &caller, &subject, Some(&caller.employee_id), selfie, up.device_info.as_deref()).await
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct OthersListBody {
+    pub enrolled_by: Option<String>,
+}
+
+/// The colleagues the token holder has enrolled, with whether each one has
+/// checked in today. `enrolled_by` is optional; when sent it must be the
+/// token holder.
+#[post("/face-attendance/others/list")]
+pub async fn face_others_list(
+    req: actix_web::HttpRequest,
+    db: web::Data<PgPool>,
+    query: web::Query<OthersQuery>,
+    body: Option<web::Json<OthersListBody>>,
+) -> HttpResponse {
+    let log = logger("ext-api/face-attendance/others/list", &req);
+    let resp = face_others_list_inner(&log, &req, &db, query.into_inner(), body.map(|b| b.into_inner())).await;
+    log_local_response(&log, resp).await
+}
+
+async fn face_others_list_inner(
+    log: &StepLogger,
+    req: &actix_web::HttpRequest,
+    db: &web::Data<PgPool>,
+    query: OthersQuery,
+    body: Option<OthersListBody>,
+) -> HttpResponse {
+    let (token_user_id, _) = match require_token_caller(req) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let enroller = body
+        .and_then(|b| b.enrolled_by)
+        .or(query.enrolled_by)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| token_user_id.to_string());
+    let caller = match identify_caller(log, req, db, Some(enroller), "enrolled_by", "FaceVerifyListOthers").await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+
+    let rows = sqlx::query_scalar::<_, Value>("SELECT attendance.face_enrolled_by($1)")
+        .bind(&caller.employee_id)
+        .fetch_one(db.get_ref())
+        .await;
+    let mut rows = match rows {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("DB error in face_others_list: {e}");
+            log.step(format!("list FAILED: {e}"));
+            return fail(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "Internal server error");
+        }
+    };
+    // Turn the stored file path into a URL the client can show; never expose
+    // the server's filesystem layout.
+    let base = public_base_url(req);
+    if let Some(list) = rows.as_array_mut() {
+        for r in list.iter_mut() {
+            let url = r
+                .get("image_path")
+                .and_then(Value::as_str)
+                .and_then(browsable_path)
+                .map(|p| format!("{base}{p}"));
+            if let Some(o) = r.as_object_mut() {
+                o.remove("image_path");
+                o.insert("image_url".into(), json!(url));
+            }
+        }
+    }
+    let count = rows.as_array().map_or(0, Vec::len);
+    reply(
+        StatusCode::OK,
+        "OK",
+        "OK",
+        json!({ "enrolled_by": caller.employee_id, "count": count, "employees": rows }),
     )
 }
 

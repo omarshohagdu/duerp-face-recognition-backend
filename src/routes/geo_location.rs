@@ -23,6 +23,14 @@
 //!   POST /ext-api/geo-location/select                         json: geo_location_office_ids[]
 //!   POST /ext-api/geo-location/remove                         json: id
 //!
+//! Employee — Office Location (Others), for an employee the caller enrolled
+//! through /face-attendance/others/enroll (sql/013_geo_location_others.sql)
+//!   POST /ext-api/geo-location/others/my                      json: employee_id, enrolled_by
+//!   POST /ext-api/geo-location/others/select                  json: employee_id, enrolled_by, geo_location_office_ids[]
+//!   POST /ext-api/geo-location/others/remove                  json: employee_id, enrolled_by, id
+//!   `enrolled_by` must be the token holder; the SQL guard then requires the
+//!   employee's active enrollment to name them as the enroller.
+//!
 //! WHY THE PATHS DIFFER FROM THE SPEC'S REST SHAPE
 //! `ExtAuthMiddleware` matches the allow-list and the permission map on the
 //! EXACT path, so `/admin/employee-geo-locations/{id}/approve` would need a row
@@ -47,7 +55,8 @@ use sqlx::query::QueryScalar;
 use sqlx::{PgPool, Postgres};
 
 use crate::routes::wow_attendance::{
-    full_path, log_local_response, public_base_url, require_token_caller,
+    du_identify, full_path, log_local_response, public_base_url, record_token_mismatch,
+    require_token_caller,
 };
 use crate::utils::step_logger::{query_to_json, StepLogger};
 
@@ -74,6 +83,8 @@ fn status_for(code: &str) -> StatusCode {
         | "INVALID_STATUS_TRANSITION"
         | "OFFICE_REVOKED"
         | "GEO_LOCATION_OFFICE_INACTIVE" => StatusCode::CONFLICT,
+        "NOT_ENROLLED_BY_YOU" => StatusCode::FORBIDDEN,
+        "NOT_YOUR_ID" => StatusCode::UNAUTHORIZED,
         "LOCATION_LIMIT_EXCEEDED" | "REASON_REQUIRED" => StatusCode::UNPROCESSABLE_ENTITY,
         _ => StatusCode::BAD_REQUEST,
     }
@@ -663,6 +674,145 @@ pub async fn remove(
     log_local_response(&log, resp).await
 }
 
+// ---------------------------------------------------------------------
+// Employee: Office Location (Others). `enrolled_by` must be the token holder;
+// which employees they may act for is decided in SQL (geo_others_guard).
+// ---------------------------------------------------------------------
+
+/// Token → `enrolled_by` is the caller → one SQL function bound with
+/// (employee_id, enrolled_by, …) → its envelope.
+async fn run_others(
+    route: &'static str,
+    success: StatusCode,
+    req: &actix_web::HttpRequest,
+    db: &web::Data<PgPool>,
+    log: &StepLogger,
+    employee_id: Option<String>,
+    enrolled_by: Option<String>,
+    sql: &'static str,
+    bind: impl FnOnce(Q<'_>) -> Q<'_>,
+) -> HttpResponse {
+    log.step("request received (others)");
+    let (person_id, token_line) = match require_token_caller(req) {
+        Ok(v) => v,
+        Err(resp) => {
+            log.step("token validation FAILED — rejecting request");
+            return resp;
+        }
+    };
+    log.step(token_line);
+
+    let employee_id = employee_id.map(|s| s.trim().to_string()).unwrap_or_default();
+    // Default to the token holder, as /geo-location/my does.
+    let enrolled_by = enrolled_by
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| person_id.to_string());
+    log.set_id(&employee_id);
+
+    if !du_identify(&enrolled_by, person_id, log).await.owned {
+        log.step(format!("Person mismatch. enrolled_by={enrolled_by} but Logged in User id={person_id}"));
+        record_token_mismatch(db.get_ref(), "GeoOthers", &enrolled_by, person_id, None, None, log).await;
+        return HttpResponse::Unauthorized().json(json!({
+            "status":  "failed",
+            "code":    "NOT_YOUR_ID",
+            "message": "`enrolled_by` must be your own employee ID.",
+            "data":    { "enrolled_by": enrolled_by, "logged_in_user_id": person_id },
+        }));
+    }
+
+    let query = bind(sqlx::query_scalar::<_, Value>(sql).bind(employee_id).bind(enrolled_by));
+    match query.fetch_one(db.get_ref()).await {
+        Ok(body) => {
+            let ok = body.get("status").and_then(Value::as_str) == Some("success");
+            let code = body.get("code").and_then(Value::as_str).unwrap_or("").to_string();
+            log.step(format!("{route}: {}", if ok { "ok" } else { code.as_str() }));
+            HttpResponse::build(if ok { success } else { status_for(&code) }).json(body)
+        }
+        Err(err) => {
+            eprintln!("DB error in {route}: {err}");
+            log.step(format!("DB call FAILED: {err}"));
+            fail(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "Internal server error")
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct OthersRequest {
+    pub employee_id: Option<String>,
+    pub enrolled_by: Option<String>,
+}
+
+#[post("/geo-location/others/my")]
+pub async fn others_my(
+    req: actix_web::HttpRequest,
+    db: web::Data<PgPool>,
+    body: web::Json<OthersRequest>,
+) -> HttpResponse {
+    let log = logger("ext-api/geo-location/others/my", &req);
+    log_json(&log, &*body);
+    let b = body.into_inner();
+    let resp = run_others(
+        "others_my", StatusCode::OK, &req, &db, &log, b.employee_id, b.enrolled_by,
+        "SELECT attendance.employee_geo_others_my($1, $2)",
+        |q| q,
+    )
+    .await;
+    log_local_response(&log, resp).await
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct OthersSelectRequest {
+    pub employee_id: Option<String>,
+    pub enrolled_by: Option<String>,
+    pub geo_location_office_ids: Vec<i64>,
+}
+
+#[post("/geo-location/others/select")]
+pub async fn others_select(
+    req: actix_web::HttpRequest,
+    db: web::Data<PgPool>,
+    body: web::Json<OthersSelectRequest>,
+) -> HttpResponse {
+    let log = logger("ext-api/geo-location/others/select", &req);
+    log_json(&log, &*body);
+    let b = body.into_inner();
+    let ids = b.geo_location_office_ids;
+    let resp = run_others(
+        "others_select", StatusCode::CREATED, &req, &db, &log, b.employee_id, b.enrolled_by,
+        "SELECT attendance.employee_geo_others_select($1, $2, $3)",
+        move |q| q.bind(ids),
+    )
+    .await;
+    log_local_response(&log, resp).await
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct OthersRemoveRequest {
+    pub employee_id: Option<String>,
+    pub enrolled_by: Option<String>,
+    pub id: i64,
+}
+
+#[post("/geo-location/others/remove")]
+pub async fn others_remove(
+    req: actix_web::HttpRequest,
+    db: web::Data<PgPool>,
+    body: web::Json<OthersRemoveRequest>,
+) -> HttpResponse {
+    let log = logger("ext-api/geo-location/others/remove", &req);
+    log_json(&log, &*body);
+    let b = body.into_inner();
+    let id = b.id;
+    let resp = run_others(
+        "others_remove", StatusCode::OK, &req, &db, &log, b.employee_id, b.enrolled_by,
+        "SELECT attendance.employee_geo_others_remove($1, $2, $3)",
+        move |q| q.bind(id),
+    )
+    .await;
+    log_local_response(&log, resp).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,6 +826,8 @@ mod tests {
         assert_eq!(status_for("LOCATION_LIMIT_EXCEEDED"), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(status_for("REASON_REQUIRED"), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(status_for("INVALID_INPUT"), StatusCode::BAD_REQUEST);
+        assert_eq!(status_for("NOT_ENROLLED_BY_YOU"), StatusCode::FORBIDDEN);
+        assert_eq!(status_for("USE_SELF_OFFICE"), StatusCode::BAD_REQUEST);
         assert_eq!(status_for("anything else"), StatusCode::BAD_REQUEST);
     }
 }
